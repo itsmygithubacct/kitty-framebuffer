@@ -27,8 +27,9 @@ extern "C" {
 #endif
 
 #define KITTYFB_VERSION_MAJOR 0
-#define KITTYFB_VERSION_MINOR 1
+#define KITTYFB_VERSION_MINOR 2
 #define KITTYFB_VERSION_PATCH 0
+#define KITTYFB_CONTROL_SEQUENCE_MAX 64
 
 typedef struct kittyfb_options {
     /* Save termios and switch the input descriptor's terminal to raw
@@ -63,6 +64,15 @@ typedef struct kittyfb_options {
      * milliseconds; high-latency connections to capable terminals need
      * a generous window.  Default 1000. */
     int probe_timeout_ms;
+
+    /* Optional NUL-terminated terminal mode controls, each at most
+     * KITTYFB_CONTROL_SEQUENCE_MAX bytes.  enter_sequence is written by
+     * the same bounded output path as the framebuffer setup.  The leave
+     * sequence is copied into the prebuilt normal/emergency restore and
+     * emitted before the cursor and alternate screen are restored.
+     * Defaults NULL. */
+    const char *enter_sequence;
+    const char *leave_sequence;
 
     /* Framebuffer pixel dimension bounds.  The chosen size is derived
      * from the terminal's reported pixel geometry, clamped into these
@@ -148,7 +158,7 @@ typedef struct kittyfb_session {
     int shown_image_id;
 
     /* prebuilt restore sequence for the async-signal path */
-    char emergency[160];
+    char emergency[224];
     size_t emergency_length;
 } kittyfb_session;
 

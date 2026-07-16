@@ -384,6 +384,8 @@ void kittyfb_options_init(kittyfb_options *options)
     options->probe_graphics = true;
     options->install_winch_handler = true;
     options->probe_timeout_ms = 1000;
+    options->enter_sequence = NULL;
+    options->leave_sequence = NULL;
     options->min_width = 640;
     options->min_height = 400;
     options->max_width = 1600;
@@ -779,13 +781,19 @@ static bool probe_for_graphics(kittyfb_session *session)
 
 static bool validate_options(const kittyfb_options *options)
 {
+    bool enter_valid = options->enter_sequence == NULL ||
+        memchr(options->enter_sequence, '\0',
+               KITTYFB_CONTROL_SEQUENCE_MAX + 1u) != NULL;
+    bool leave_valid = options->leave_sequence == NULL ||
+        memchr(options->leave_sequence, '\0',
+               KITTYFB_CONTROL_SEQUENCE_MAX + 1u) != NULL;
     return options->min_width > 0 && options->min_height > 0 &&
            options->min_width <= options->max_width &&
            options->min_height <= options->max_height &&
            options->image_id_a > 0 && options->image_id_b > 0 &&
            options->image_id_a != options->image_id_b &&
            options->zlib_level >= -1 && options->zlib_level <= 9 &&
-           options->probe_timeout_ms >= 0;
+           options->probe_timeout_ms >= 0 && enter_valid && leave_valid;
 }
 
 static bool build_emergency_sequence(kittyfb_session *session)
@@ -803,9 +811,11 @@ static bool build_emergency_sequence(kittyfb_session *session)
         "\x1b[?2026l\x1b\\"
         "\x1b_Ga=d,d=i,i=%d,q=2\x1b\\"
         "\x1b_Ga=d,d=i,i=%d,q=2\x1b\\"
-        "\x1b[?2026l%s%s",
+        "\x1b[?2026l%s%s%s",
         session->options.image_id_a,
         session->options.image_id_b,
+        session->options.leave_sequence != NULL
+            ? session->options.leave_sequence : "",
         session->options.hide_cursor ? "\x1b[?25h" : "",
         session->options.manage_alt_screen ? "\x1b[?1049l" : "");
     if (printed < 0 || (size_t)printed >= sizeof(session->emergency)) {
@@ -841,6 +851,7 @@ int kittyfb_start(
     char setup[32];
     int printed;
     int failure;
+    bool setup_started = false;
 
     if (session == NULL || input_fd < 0 || output_fd < 0) {
         errno = EINVAL;
@@ -961,8 +972,14 @@ int kittyfb_start(
         "%s%s\x1b[2J\x1b[H",
         session->options.manage_alt_screen ? "\x1b[?1049h" : "",
         session->options.hide_cursor ? "\x1b[?25l" : "");
+    setup_started = true;
     if (printed < 0 || (size_t)printed >= sizeof(setup) ||
         !write_all(session, setup, (size_t)printed)) {
+        goto fail;
+    }
+    if (session->options.enter_sequence != NULL &&
+        !write_all(session, session->options.enter_sequence,
+                   strlen(session->options.enter_sequence))) {
         goto fail;
     }
 
@@ -971,6 +988,10 @@ int kittyfb_start(
 
 fail:
     failure = errno;
+    if (setup_started && session->emergency_length > 0) {
+        (void)write_all(session, session->emergency,
+                        session->emergency_length);
+    }
     if (session->winch_handler_installed) {
         (void)sigaction(SIGWINCH, &session->saved_winch_action, NULL);
         session->winch_handler_installed = false;

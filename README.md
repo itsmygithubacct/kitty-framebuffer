@@ -79,6 +79,13 @@ the configured bounds (640x400 .. 1600x1000 by default), snapped to whole
 cells and centered, with one cell row left free for the shell prompt
 after exit.
 
+Applications that need an additional terminal mode, such as mouse tracking,
+can set `options.enter_sequence` and `options.leave_sequence`. The enter
+sequence uses the same bounded nonblocking writer as framebuffer setup. The
+leave sequence is copied into both normal and emergency restore paths, before
+the cursor and alternate screen are restored; each sequence is limited to
+`KITTYFB_CONTROL_SEQUENCE_MAX` bytes.
+
 ## Presenting frames
 
 `kittyfb_present()` copies the frame out and returns immediately;

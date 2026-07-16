@@ -513,6 +513,7 @@ test_options_defaults(void)
     CHECK(options.probe_graphics);
     CHECK(options.install_winch_handler);
     CHECK(options.probe_timeout_ms == 1000);
+    CHECK(options.enter_sequence == NULL && options.leave_sequence == NULL);
     CHECK(options.min_width == 640 && options.min_height == 400);
     CHECK(options.max_width == 1600 && options.max_height == 1000);
     CHECK(options.image_id_a == 1 && options.image_id_b == 2);
@@ -699,6 +700,7 @@ test_pty_lifecycle(void)
     struct termios original;
     struct termios restored;
     kittyfb_session session;
+    kittyfb_options options;
     kittyfb_stats stats;
     static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
     static char buffer[65536];
@@ -707,12 +709,15 @@ test_pty_lifecycle(void)
         "\x1b[?2026l\x1b\\"
         "\x1b_Ga=d,d=i,i=1,q=2\x1b\\"
         "\x1b_Ga=d,d=i,i=2,q=2\x1b\\"
-        "\x1b[?2026l\x1b[?25h\x1b[?1049l";
+        "\x1b[?2026l\x1b[?1003l\x1b[?25h\x1b[?1049l";
 
     CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, &original));
 
     kittyfb_session_init(&session);
-    CHECK(start_with_fake_terminal(&session, master, slave, NULL,
+    kittyfb_options_init(&options);
+    options.enter_sequence = "\x1b[?1003h";
+    options.leave_sequence = "\x1b[?1003l";
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
                                    graphics_reply, NULL) == 0);
     CHECK(kittyfb_width(&session) == 900);
     CHECK(kittyfb_height(&session) == 522);
@@ -724,6 +729,7 @@ test_pty_lifecycle(void)
     CHECK(contains_str(buffer, used,
                        "\x1b_Gi=31,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\\x1b[c"));
     CHECK(contains_str(buffer, used, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H"));
+    CHECK(contains_str(buffer, used, "\x1b[?1003h"));
 
     /* First frame goes out under id 1 inside a synchronized update and
      * deletes id 2; the pixel data round-trips through zlib + base64. */
@@ -858,6 +864,7 @@ test_pty_probe_disabled_starts_blind(void)
     kittyfb_options options;
     static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
     static char buffer[65536];
+    char overlong[KITTYFB_CONTROL_SEQUENCE_MAX + 2u];
     size_t used;
 
     CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
@@ -865,6 +872,13 @@ test_pty_probe_disabled_starts_blind(void)
     kittyfb_session_init(&session);
     kittyfb_options_init(&options);
     options.probe_graphics = false;
+    (void)memset(overlong, 'x', sizeof(overlong));
+    overlong[sizeof(overlong) - 1u] = '\0';
+    options.enter_sequence = overlong;
+    errno = 0;
+    CHECK(kittyfb_start(&session, slave, slave, &options) == -1);
+    CHECK(errno == EINVAL);
+    options.enter_sequence = NULL;
     CHECK(kittyfb_start(&session, slave, slave, &options) == 0);
 
     used = read_available(master, buffer, sizeof(buffer));
@@ -890,6 +904,7 @@ test_pty_emergency_restore(void)
     struct termios original;
     struct termios after;
     kittyfb_session session;
+    kittyfb_options options;
     static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
     static char buffer[65536];
     size_t used;
@@ -897,12 +912,15 @@ test_pty_emergency_restore(void)
         "\x1b[?2026l\x1b\\"
         "\x1b_Ga=d,d=i,i=1,q=2\x1b\\"
         "\x1b_Ga=d,d=i,i=2,q=2\x1b\\"
-        "\x1b[?2026l\x1b[?25h\x1b[?1049l";
+        "\x1b[?2026l\x1b[?1006l\x1b[?25h\x1b[?1049l";
 
     CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, &original));
 
     kittyfb_session_init(&session);
-    CHECK(start_with_fake_terminal(&session, master, slave, NULL,
+    kittyfb_options_init(&options);
+    options.enter_sequence = "\x1b[?1006h";
+    options.leave_sequence = "\x1b[?1006l";
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
                                    graphics_reply, NULL) == 0);
     drain_descriptor(master);
     CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 0u,
