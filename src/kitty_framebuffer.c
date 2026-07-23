@@ -310,7 +310,8 @@ static bool write_all(kittyfb_session *session, const char *data, size_t size)
     int stalled_polls = 0;
 
     while (offset < size) {
-        if (session->presenter_disabled || session->write_cancel) {
+        if (__atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE)) {
             return false;
         }
         ssize_t count = write(session->output_fd, data + offset, size - offset);
@@ -430,7 +431,17 @@ int kittyfb_cell_height(const kittyfb_session *session)
 
 bool kittyfb_failed(const kittyfb_session *session)
 {
-    return session != NULL && session->presenter_failed;
+    bool failed;
+    kittyfb_session *mutable_session;
+
+    if (session == NULL) return false;
+    /* Locking is logically const: it protects the snapshot without changing
+     * the session's observable state. */
+    mutable_session = (kittyfb_session *)session;
+    pthread_mutex_lock(&mutable_session->frame_lock);
+    failed = mutable_session->presenter_failed;
+    pthread_mutex_unlock(&mutable_session->frame_lock);
+    return failed;
 }
 
 void kittyfb_get_stats(kittyfb_session *session, kittyfb_stats *out)
@@ -456,7 +467,7 @@ static bool encode_and_write(
     bool clear_first)
 {
     /* A signal-time restore has fenced the presenter: emit nothing. */
-    if (session->presenter_disabled) {
+    if (__atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE)) {
         return false;
     }
     if (rgba == NULL || width <= 0 || height <= 0) {
@@ -544,7 +555,7 @@ static bool encode_and_write(
 
     /* Re-check the fence right before the write: if a restore raced in
      * after the top check, this frame's packet must not go out at all. */
-    if (session->presenter_disabled) {
+    if (__atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE)) {
         return false;
     }
     if (!write_all(session, session->packet_buffer, packet_length)) {
@@ -600,7 +611,9 @@ static void *presenter_main(void *opaque)
         pthread_mutex_lock(&session->frame_lock);
         if (encoded) {
             session->stats.frames_encoded++;
-        } else if (!session->write_cancel && !session->presenter_disabled) {
+        } else if (!__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) &&
+                   !__atomic_load_n(&session->presenter_disabled,
+                                    __ATOMIC_ACQUIRE)) {
             /* A cancelled or fenced write is shutdown noise, not a
              * failure; anything else latches so the caller can stop. */
             session->stats.encode_failures++;
@@ -688,7 +701,7 @@ bool kittyfb_present(
 /* Join the presenter and release its memory.  Safe when never started. */
 static void presenter_shutdown(kittyfb_session *session)
 {
-    session->write_cancel = 1;
+    __atomic_store_n(&session->write_cancel, 1, __ATOMIC_RELEASE);
     pthread_mutex_lock(&session->frame_lock);
     bool must_join = session->presenter_started;
     session->presenter_running = false;
@@ -720,7 +733,7 @@ static void presenter_shutdown(kittyfb_session *session)
     session->b64_capacity = 0;
     session->packet_capacity = 0;
     pthread_mutex_unlock(&session->frame_lock);
-    session->write_cancel = 0;
+    __atomic_store_n(&session->write_cancel, 0, __ATOMIC_RELEASE);
 }
 
 /* ------------------------------- lifecycle ------------------------------ */
@@ -902,8 +915,8 @@ int kittyfb_start(
      * and a latched claim or fence from the previous run must not
      * swallow this run's shutdown. */
     session->shutdown_claimed = 0;
-    session->presenter_disabled = 0;
-    session->write_cancel = 0;
+    __atomic_store_n(&session->presenter_disabled, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&session->write_cancel, 0, __ATOMIC_RELEASE);
     session->presenter_started = false;
     session->presenter_running = false;
     session->presenter_failed = false;
@@ -1078,12 +1091,8 @@ static bool claim_shutdown(kittyfb_session *session)
     return !__sync_lock_test_and_set(&session->shutdown_claimed, 1);
 }
 
-static void restore_terminal(kittyfb_session *session)
+static void restore_process_state(kittyfb_session *session)
 {
-    if (session->emergency_length > 0) {
-        (void)write_all(session, session->emergency,
-                        session->emergency_length);
-    }
     if (session->termios_saved) {
         (void)tcsetattr(session->input_fd, TCSAFLUSH,
                         &session->saved_termios);
@@ -1100,6 +1109,15 @@ static void restore_terminal(kittyfb_session *session)
     }
 }
 
+static void restore_terminal(kittyfb_session *session)
+{
+    if (session->emergency_length > 0) {
+        (void)write_all(session, session->emergency,
+                        session->emergency_length);
+    }
+    restore_process_state(session);
+}
+
 void kittyfb_stop(kittyfb_session *session)
 {
     if (session == NULL || (!session->active && !session->presenter_started)) {
@@ -1111,6 +1129,12 @@ void kittyfb_stop(kittyfb_session *session)
     presenter_shutdown(session);
     if (claim_shutdown(session)) {
         restore_terminal(session);
+    } else {
+        /* The signal-safe path cannot clear ordinary bool bookkeeping or
+         * restore the process's previous SIGWINCH disposition.  Retry the
+         * idempotent OS-state restoration here without emitting the terminal
+         * escape sequence a second time. */
+        restore_process_state(session);
     }
     session->active = 0;
 }
@@ -1123,7 +1147,7 @@ void kittyfb_emergency_restore(kittyfb_session *session)
     /* Fence the presenter first (an async-signal-safe flag write): the
      * thread cannot be joined from a signal handler, so this stops it
      * emitting bytes that would interleave with the restore below. */
-    session->presenter_disabled = 1;
+    __atomic_store_n(&session->presenter_disabled, 1, __ATOMIC_RELEASE);
     if (!claim_shutdown(session)) {
         return;
     }

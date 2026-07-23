@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <pty.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,6 +36,11 @@
  * APC query answer followed by a primary device-attributes response. */
 static const char graphics_reply[] = "\x1b_Gi=31;OK\x1b\\\x1b[?62;4c";
 static const char da1_only_reply[] = "\x1b[?6c";
+
+static void test_winch_handler(int signal_number)
+{
+    (void)signal_number;
+}
 
 static int64_t
 monotonic_milliseconds(void)
@@ -546,6 +552,42 @@ test_inactive_session_is_safe(void)
     return true;
 }
 
+typedef struct failure_writer {
+    kittyfb_session *session;
+    size_t iterations;
+} failure_writer;
+
+static void *toggle_presenter_failure(void *argument)
+{
+    failure_writer *writer = argument;
+    size_t index;
+
+    for (index = 0u; index < writer->iterations; ++index) {
+        pthread_mutex_lock(&writer->session->frame_lock);
+        writer->session->presenter_failed = (index & 1u) != 0u;
+        pthread_mutex_unlock(&writer->session->frame_lock);
+    }
+    return NULL;
+}
+
+static bool
+test_failure_snapshot_is_synchronized(void)
+{
+    kittyfb_session session;
+    failure_writer writer;
+    pthread_t thread;
+    size_t index;
+
+    kittyfb_session_init(&session);
+    writer.session = &session;
+    writer.iterations = 10000u;
+    CHECK(pthread_create(&thread, NULL, toggle_presenter_failure, &writer) == 0);
+    for (index = 0u; index < writer.iterations; ++index)
+        (void)kittyfb_failed(&session);
+    CHECK(pthread_join(thread, NULL) == 0);
+    return true;
+}
+
 /* ------------------------------- PTY tests ------------------------------ */
 
 /*
@@ -903,6 +945,9 @@ test_pty_emergency_restore(void)
     int slave = -1;
     struct termios original;
     struct termios after;
+    struct sigaction previous_winch;
+    struct sigaction expected_winch;
+    struct sigaction restored_winch;
     kittyfb_session session;
     kittyfb_options options;
     static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
@@ -913,6 +958,11 @@ test_pty_emergency_restore(void)
         "\x1b_Ga=d,d=i,i=1,q=2\x1b\\"
         "\x1b_Ga=d,d=i,i=2,q=2\x1b\\"
         "\x1b[?2026l\x1b[?1006l\x1b[?25h\x1b[?1049l";
+
+    (void)memset(&expected_winch, 0, sizeof expected_winch);
+    expected_winch.sa_handler = test_winch_handler;
+    CHECK(sigemptyset(&expected_winch.sa_mask) == 0);
+    CHECK(sigaction(SIGWINCH, &expected_winch, &previous_winch) == 0);
 
     CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, &original));
 
@@ -941,6 +991,10 @@ test_pty_emergency_restore(void)
     CHECK(!kittyfb_present(&session, frame, FRAME_W, FRAME_H));
     kittyfb_emergency_restore(&session);
     kittyfb_stop(&session);
+    CHECK(sigaction(SIGWINCH, NULL, &restored_winch) == 0);
+    CHECK(restored_winch.sa_handler == test_winch_handler);
+    CHECK(!session.winch_handler_installed);
+    CHECK(sigaction(SIGWINCH, &previous_winch, NULL) == 0);
 
     CHECK(close(master) == 0);
     CHECK(close(slave) == 0);
@@ -1013,6 +1067,8 @@ main(void)
         {"packet wrapper and delete", test_packet_wrapper_and_delete},
         {"options defaults", test_options_defaults},
         {"inactive session is safe", test_inactive_session_is_safe},
+        {"failure snapshot is synchronized",
+         test_failure_snapshot_is_synchronized},
         {"PTY lifecycle", test_pty_lifecycle},
         {"PTY start after stop", test_pty_start_after_stop},
         {"PTY probe rejects DA1-only terminal",
