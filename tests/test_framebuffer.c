@@ -864,6 +864,90 @@ test_pty_start_after_stop(void)
 }
 
 static bool
+test_pty_suspend_retains_buffers(void)
+{
+    enum { FRAME_W = 16, FRAME_H = 8 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[65536];
+    uint8_t *pending;
+    uint8_t *encoding;
+    uint8_t *rgb;
+    uint8_t *compressed;
+    char *base64;
+    char *packet;
+    size_t pending_capacity;
+    size_t encode_capacity;
+    size_t used;
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.probe_graphics = false;
+    CHECK(kittyfb_start(&session, slave, slave, &options) == 0);
+    drain_descriptor(master);
+    CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 0u,
+                              buffer, sizeof(buffer), &used));
+    CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
+                              buffer, sizeof(buffer), &used));
+    CHECK(session.pending_buffer != NULL);
+    CHECK(session.encode_buffer != NULL);
+    CHECK(session.rgb_buffer != NULL);
+    CHECK(session.z_buffer != NULL);
+    CHECK(session.b64_buffer != NULL);
+    CHECK(session.packet_buffer != NULL);
+    pending = session.pending_buffer;
+    encoding = session.encode_buffer;
+    rgb = session.rgb_buffer;
+    compressed = session.z_buffer;
+    base64 = session.b64_buffer;
+    packet = session.packet_buffer;
+    pending_capacity = session.pending_capacity;
+    encode_capacity = session.encode_capacity;
+
+    kittyfb_suspend(&session);
+    CHECK(!session.active);
+    CHECK(!session.presenter_started);
+    CHECK(session.pending_buffer == pending);
+    CHECK(session.encode_buffer == encoding);
+    CHECK(session.rgb_buffer == rgb);
+    CHECK(session.z_buffer == compressed);
+    CHECK(session.b64_buffer == base64);
+    CHECK(session.packet_buffer == packet);
+    CHECK(session.pending_capacity == pending_capacity);
+    CHECK(session.encode_capacity == encode_capacity);
+    kittyfb_suspend(&session);
+
+    drain_descriptor(master);
+    CHECK(kittyfb_start(&session, slave, slave, &options) == 0);
+    CHECK(session.pending_buffer == pending);
+    CHECK(session.encode_buffer == encoding);
+    CHECK(session.rgb_buffer == rgb);
+    CHECK(session.z_buffer == compressed);
+    CHECK(session.b64_buffer == base64);
+    CHECK(session.packet_buffer == packet);
+    kittyfb_suspend(&session);
+
+    /* Final stop releases retained storage even while suspended. */
+    kittyfb_stop(&session);
+    CHECK(session.pending_buffer == NULL);
+    CHECK(session.encode_buffer == NULL);
+    CHECK(session.rgb_buffer == NULL);
+    CHECK(session.z_buffer == NULL);
+    CHECK(session.b64_buffer == NULL);
+    CHECK(session.packet_buffer == NULL);
+    CHECK(session.pending_capacity == 0u);
+    CHECK(session.encode_capacity == 0u);
+
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
+static bool
 test_pty_probe_rejects_da1_only_terminal(void)
 {
     int master = -1;
@@ -1071,6 +1155,7 @@ main(void)
          test_failure_snapshot_is_synchronized},
         {"PTY lifecycle", test_pty_lifecycle},
         {"PTY start after stop", test_pty_start_after_stop},
+        {"PTY suspend retains buffers", test_pty_suspend_retains_buffers},
         {"PTY probe rejects DA1-only terminal",
          test_pty_probe_rejects_da1_only_terminal},
         {"PTY probe disabled starts blind",

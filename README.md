@@ -115,6 +115,12 @@ SIGWINCH can set `install_winch_handler = false` and optionally call
 
 ## Shutdown and emergency restore
 
+`kittyfb_suspend()` joins the presenter and restores the terminal but retains
+the frame and encoder buffers at their high-water capacities. Call
+`kittyfb_start()` after continuation; repeated job-control cycles then reuse
+the large allocations. A final `kittyfb_stop()` releases retained storage
+whether or not the session was restarted.
+
 `kittyfb_stop()` joins the presenter thread, frees its buffers, and
 restores the terminal: it ends any pending synchronized update *first*
 (a truncated update would freeze the terminal), closes any half-written

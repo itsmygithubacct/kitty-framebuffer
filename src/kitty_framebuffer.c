@@ -698,8 +698,12 @@ bool kittyfb_present(
     return true;
 }
 
-/* Join the presenter and release its memory.  Safe when never started. */
-static void presenter_shutdown(kittyfb_session *session)
+/* Join the presenter.  Suspension retains high-water buffers so a
+ * stop/start job-control cycle does not churn multi-megabyte allocations;
+ * final shutdown releases them.  Safe when the thread was never started. */
+static void presenter_shutdown(
+    kittyfb_session *session,
+    bool release_buffers)
 {
     __atomic_store_n(&session->write_cancel, 1, __ATOMIC_RELEASE);
     pthread_mutex_lock(&session->frame_lock);
@@ -714,24 +718,26 @@ static void presenter_shutdown(kittyfb_session *session)
 
     pthread_mutex_lock(&session->frame_lock);
     session->presenter_started = false;
-    free(session->pending_buffer);
-    free(session->encode_buffer);
-    session->pending_buffer = NULL;
-    session->encode_buffer = NULL;
-    session->pending_capacity = 0;
-    session->encode_capacity = 0;
-    free(session->rgb_buffer);
-    free(session->z_buffer);
-    free(session->b64_buffer);
-    free(session->packet_buffer);
-    session->rgb_buffer = NULL;
-    session->z_buffer = NULL;
-    session->b64_buffer = NULL;
-    session->packet_buffer = NULL;
-    session->rgb_capacity = 0;
-    session->z_capacity = 0;
-    session->b64_capacity = 0;
-    session->packet_capacity = 0;
+    if (release_buffers) {
+        free(session->pending_buffer);
+        free(session->encode_buffer);
+        session->pending_buffer = NULL;
+        session->encode_buffer = NULL;
+        session->pending_capacity = 0;
+        session->encode_capacity = 0;
+        free(session->rgb_buffer);
+        free(session->z_buffer);
+        free(session->b64_buffer);
+        free(session->packet_buffer);
+        session->rgb_buffer = NULL;
+        session->z_buffer = NULL;
+        session->b64_buffer = NULL;
+        session->packet_buffer = NULL;
+        session->rgb_capacity = 0;
+        session->z_capacity = 0;
+        session->b64_capacity = 0;
+        session->packet_capacity = 0;
+    }
     pthread_mutex_unlock(&session->frame_lock);
     __atomic_store_n(&session->write_cancel, 0, __ATOMIC_RELEASE);
 }
@@ -1120,20 +1126,49 @@ static void restore_terminal(kittyfb_session *session)
 
 void kittyfb_stop(kittyfb_session *session)
 {
-    if (session == NULL || (!session->active && !session->presenter_started)) {
+    bool restore;
+    bool retained;
+
+    if (session == NULL) {
         return;
     }
+    restore = session->active || session->presenter_started;
+    retained =
+        session->pending_buffer != NULL ||
+        session->encode_buffer != NULL ||
+        session->rgb_buffer != NULL ||
+        session->z_buffer != NULL ||
+        session->b64_buffer != NULL ||
+        session->packet_buffer != NULL;
+    if (!restore && !retained) return;
     /* Stop the presenter first so no frame write interleaves with the
      * restore sequence.  This also reclaims the thread and buffers after
      * an emergency restore already released the terminal. */
-    presenter_shutdown(session);
+    presenter_shutdown(session, true);
+    if (restore) {
+        if (claim_shutdown(session)) {
+            restore_terminal(session);
+        } else {
+            /* The signal-safe path cannot clear ordinary bool bookkeeping or
+             * restore the process's previous SIGWINCH disposition.  Retry the
+             * idempotent OS-state restoration here without emitting the
+             * terminal escape sequence a second time. */
+            restore_process_state(session);
+        }
+    }
+    session->active = 0;
+}
+
+void kittyfb_suspend(kittyfb_session *session)
+{
+    if (session == NULL ||
+        (!session->active && !session->presenter_started)) {
+        return;
+    }
+    presenter_shutdown(session, false);
     if (claim_shutdown(session)) {
         restore_terminal(session);
     } else {
-        /* The signal-safe path cannot clear ordinary bool bookkeeping or
-         * restore the process's previous SIGWINCH disposition.  Retry the
-         * idempotent OS-state restoration here without emitting the terminal
-         * escape sequence a second time. */
         restore_process_state(session);
     }
     session->active = 0;

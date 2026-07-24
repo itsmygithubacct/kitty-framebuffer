@@ -225,6 +225,15 @@ bool kittyfb_check_resize(kittyfb_session *session, int *width, int *height);
 void kittyfb_notify_resize(void);
 
 /*
+ * Join the presenter and restore the terminal while retaining all
+ * high-water frame and encoder buffers.  Use before process suspension,
+ * then call kittyfb_start() after continuation.  A later kittyfb_stop()
+ * releases the retained storage even if the session was not restarted.
+ * Safe to call twice.
+ */
+void kittyfb_suspend(kittyfb_session *session);
+
+/*
  * Join the presenter thread, free its buffers and restore the terminal:
  * close any half-written graphics escape, end a pending synchronized
  * update, delete this session's two image ids (and no other images),
