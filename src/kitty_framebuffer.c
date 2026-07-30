@@ -107,6 +107,38 @@ size_t kittyfb_base64_encode(const uint8_t *input, size_t length, char *output)
     return out;
 }
 
+int kittyfb_snap_axis(int value, int cell, int minimum, int maximum)
+{
+    int64_t step;
+    int64_t snapped;
+
+    if (cell <= 0 || minimum <= 0 || maximum < minimum) {
+        return 0;
+    }
+    if (value < minimum) {
+        value = minimum;
+    } else if (value > maximum) {
+        value = maximum;
+    }
+
+    /* An odd cell dimension needs a two-cell step for an even pixel size. */
+    step = (cell % 2 == 0) ? cell : (int64_t)cell * 2;
+    snapped = ((int64_t)value / step) * step;
+    if (snapped < minimum) {
+        int64_t rounded_minimum =
+            (((int64_t)minimum + step - 1) / step) * step;
+
+        snapped = rounded_minimum <= maximum
+            ? rounded_minimum
+            : ((int64_t)maximum / step) * step;
+    }
+    if (snapped <= 0) {
+        /* No cell-aligned value fits. Preserve the hard maximum bound. */
+        snapped = (int64_t)maximum & ~INT64_C(1);
+    }
+    return (int)snapped;
+}
+
 bool kittyfb_derive_geometry(
     int columns,
     int rows,
@@ -152,12 +184,13 @@ bool kittyfb_derive_geometry(
     if (height > options->max_height) {
         height = options->max_height;
     }
-    /* snap to whole cells so the image doesn't end in a ragged
-     * partially-covered cell column/row, then force even dimensions */
-    width -= width % cell_width;
-    height -= height % cell_height;
-    width &= ~1;
-    height &= ~1;
+    /* Snap to whole, even cell groups without crossing back below the
+     * requested minimum. A minimum can encode a required integer scale,
+     * so rounding below it is more harmful than covering one extra cell. */
+    width = kittyfb_snap_axis(
+        width, cell_width, options->min_width, options->max_width);
+    height = kittyfb_snap_axis(
+        height, cell_height, options->min_height, options->max_height);
     if (width <= 0 || height <= 0) {
         return false;
     }

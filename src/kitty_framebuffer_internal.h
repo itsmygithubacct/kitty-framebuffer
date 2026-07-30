@@ -33,6 +33,13 @@ size_t kittyfb_base64_encode(
     char *output);
 
 /*
+ * Snap one dimension to complete cells and an even pixel size. Rounding
+ * prefers the value below the target unless that would violate minimum;
+ * maximum remains a hard bound.
+ */
+int kittyfb_snap_axis(int value, int cell, int minimum, int maximum);
+
+/*
  * Derive the framebuffer geometry from a terminal report of columns x
  * rows cells and xpixel x ypixel total pixels (either pixel value may be
  * zero; 9x18 cells are assumed).  One cell row is reserved at the bottom

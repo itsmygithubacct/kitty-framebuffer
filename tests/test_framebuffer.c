@@ -403,19 +403,31 @@ test_geometry_small_terminal_clamps(void)
 
     kittyfb_options_init(&options);
 
-    /* A tiny terminal upscales to the minimum, then snaps to whole
-     * cells and even pixels; the origin clamps to the top-left. */
+    /* A tiny terminal upscales to the first complete, even cell group
+     * at or above the minimum; the origin clamps to the top-left. */
     CHECK(kittyfb_derive_geometry(40, 12, 0, 0, &options, &geometry));
-    CHECK(geometry.width == 638 && geometry.height == 396);
+    CHECK(geometry.width == 648 && geometry.height == 414);
     CHECK(geometry.width % 2 == 0 && geometry.height % 2 == 0);
     CHECK(geometry.origin_row == 1 && geometry.origin_column == 1);
 
-    /* Clamping to the maximum snaps down to whole cells (700 -> 693 for
-     * 9-pixel cells), then forces even pixel counts (693 -> 692). */
+    /* The maximum remains hard. Odd-width cells use two-cell groups so
+     * the result stays both cell-aligned and even. */
     options.max_width = 700;
     options.max_height = 500;
     CHECK(kittyfb_derive_geometry(100, 30, 900, 540, &options, &geometry));
-    CHECK(geometry.width == 692 && geometry.height == 486);
+    CHECK(geometry.width == 684 && geometry.height == 486);
+
+    /* A 480-pixel minimum must not snap down to 476 with 34-pixel cells:
+     * callers use the minimum to protect an integer render scale. */
+    kittyfb_options_init(&options);
+    options.min_height = 480;
+    CHECK(kittyfb_derive_geometry(80, 15, 720, 510, &options, &geometry));
+    CHECK(geometry.height == 510);
+
+    CHECK(kittyfb_snap_axis(640, 9, 640, 1600) == 648);
+    CHECK(kittyfb_snap_axis(480, 34, 480, 1000) == 510);
+    CHECK(kittyfb_snap_axis(700, 9, 640, 700) == 684);
+    CHECK(kittyfb_snap_axis(500, 18, 400, 500) == 486);
     return true;
 }
 
