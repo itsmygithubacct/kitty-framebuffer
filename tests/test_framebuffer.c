@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -536,6 +538,65 @@ test_options_defaults(void)
     CHECK(options.max_width == 1600 && options.max_height == 1000);
     CHECK(options.image_id_a == 1 && options.image_id_b == 2);
     CHECK(options.zlib_level == 1);
+    CHECK(options.transport == KITTYFB_TRANSPORT_AUTO);
+    CHECK(options.shm_slots == 3);
+    return true;
+}
+
+static bool
+test_shm_packet_shape(void)
+{
+    static char packet[1024];
+    static const char name[] = "/kilix-fb-1234-0-2";
+    static char encoded[64];
+    static char expected[256];
+    size_t encoded_length;
+    size_t length;
+
+    length = kittyfb_build_shm_packet(
+        packet, sizeof(packet), name, 1, 2, 320, 180, "\x1b[3;5H", false);
+    CHECK(length > 0u);
+
+    /* The payload is the base64 of the object NAME, not of any pixels:
+     * that is the entire point of this transport. */
+    encoded_length = kittyfb_base64_encode(
+        (const uint8_t *)name, strlen(name), encoded);
+    CHECK(encoded_length > 0u);
+    CHECK((size_t)snprintf(expected, sizeof(expected),
+                           "\x1b_Ga=T,f=32,i=1,q=2,t=s,s=320,v=180;%.*s\x1b\\",
+                           (int)encoded_length, encoded) < sizeof(expected));
+    CHECK(contains_str(packet, length, expected));
+
+    /* Same wrapper contract as the inline form: synchronized update,
+     * cursor origin, targeted delete of the other id, update end. */
+    CHECK(starts_with(packet, length, "\x1b[?2026h\x1b[3;5H"));
+    CHECK(contains_str(packet, length, "\x1b_Ga=d,d=I,i=2,q=2\x1b\\"));
+    CHECK(ends_with(packet, length, "\x1b[?2026l"));
+
+    /* No pixels travel: the whole packet is far below one inline chunk. */
+    CHECK(length < KITTYFB_CHUNK_SIZE);
+
+    /* Nothing is compressed, so o=z must not appear. */
+    CHECK(!contains_str(packet, length, "o=z"));
+
+    /* clear_first inserts the erase before the cursor move. */
+    length = kittyfb_build_shm_packet(
+        packet, sizeof(packet), name, 2, 1, 320, 180, "\x1b[1;1H", true);
+    CHECK(length > 0u);
+    CHECK(starts_with(packet, length, "\x1b[?2026h\x1b[2J\x1b[1;1H"));
+
+    /* Rejections: bad ids, bad geometry, an empty or oversized name, and
+     * a capacity that cannot hold the result. */
+    CHECK(kittyfb_build_shm_packet(packet, sizeof(packet), name, 0, 2, 320,
+                                   180, "\x1b[1;1H", false) == 0u);
+    CHECK(kittyfb_build_shm_packet(packet, sizeof(packet), name, 1, 2, 0, 180,
+                                   "\x1b[1;1H", false) == 0u);
+    CHECK(kittyfb_build_shm_packet(packet, sizeof(packet), "", 1, 2, 320, 180,
+                                   "\x1b[1;1H", false) == 0u);
+    CHECK(kittyfb_build_shm_packet(packet, 16u, name, 1, 2, 320, 180,
+                                   "\x1b[1;1H", false) == 0u);
+    CHECK(kittyfb_build_shm_packet(packet, sizeof(packet), NULL, 1, 2, 320,
+                                   180, "\x1b[1;1H", false) == 0u);
     return true;
 }
 
@@ -648,7 +709,18 @@ start_with_fake_terminal(
 {
     probe_replier replier;
     pthread_t thread;
+    kittyfb_options inline_defaults;
     int result;
+
+    /* Tests that do not care about the transport still need a
+     * deterministic one: AUTO would pick shared memory on a machine
+     * outside tmux, and every wire-format assertion here describes the
+     * inline encoding.  Shared memory has its own tests. */
+    if (options == NULL) {
+        kittyfb_options_init(&inline_defaults);
+        inline_defaults.transport = KITTYFB_TRANSPORT_INLINE;
+        options = &inline_defaults;
+    }
 
     replier.master_fd = master;
     replier.reply = reply;
@@ -727,6 +799,94 @@ decoded_payload_matches(
     return true;
 }
 
+/*
+ * Extract the shared-memory object name from a t=s packet: the payload
+ * between the header's ';' and the APC terminator is the base64 of the
+ * name.
+ */
+static bool
+extract_shm_name(
+    const char *buffer,
+    size_t used,
+    char *name,
+    size_t name_capacity)
+{
+    static const char header[] = "\x1b_Ga=T,f=32,";
+    size_t header_at;
+    size_t semicolon;
+    size_t payload_start;
+    size_t payload_size;
+    size_t decoded;
+
+    header_at = find_bytes(buffer, used, header, strlen(header));
+    CHECK(header_at != SIZE_MAX);
+    semicolon = find_bytes(buffer + header_at, used - header_at, ";", 1u);
+    CHECK(semicolon != SIZE_MAX);
+    payload_start = header_at + semicolon + 1u;
+    payload_size = find_bytes(buffer + payload_start, used - payload_start,
+                              "\x1b\\", 2u);
+    CHECK(payload_size != SIZE_MAX);
+    CHECK(payload_size > 0u);
+
+    decoded = base64_decode(buffer + payload_start, payload_size,
+                            (uint8_t *)name);
+    CHECK(decoded > 0u && decoded < name_capacity);
+    name[decoded] = '\0';
+    /* POSIX shared-memory names are absolute. */
+    CHECK(name[0] == '/');
+    return true;
+}
+
+/*
+ * Do exactly what Kitty does with a t=s transmission: open the named
+ * object, map it, and unlink it.  The unlink is the acknowledgement the
+ * ring polls for, so a test that skips it deliberately saturates the
+ * ring.  The mapped pixels are compared against what was presented.
+ */
+static bool
+consume_shm_frame(
+    const char *name,
+    const uint8_t *rgba,
+    int width,
+    int height)
+{
+    size_t size = (size_t)width * (size_t)height * 4u;
+    int fd = shm_open(name, O_RDONLY, 0);
+    void *mapping;
+    struct stat info;
+
+    CHECK(fd >= 0);
+    CHECK(fstat(fd, &info) == 0);
+    /* f=32 means the object carries RGBA, alpha included - the inline
+     * path's alpha strip buys nothing once no bytes cross the wire. */
+    CHECK((size_t)info.st_size == size);
+    mapping = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    CHECK(mapping != MAP_FAILED);
+    CHECK(memcmp(mapping, rgba, size) == 0);
+    CHECK(munmap(mapping, size) == 0);
+    CHECK(close(fd) == 0);
+    CHECK(shm_unlink(name) == 0);
+    return true;
+}
+
+static bool
+wait_for_dropped_frames(kittyfb_session *session, uint64_t minimum)
+{
+    const int64_t deadline = monotonic_milliseconds() + 3000;
+    kittyfb_stats stats;
+
+    for (;;) {
+        kittyfb_get_stats(session, &stats);
+        if (stats.frames_dropped >= minimum) {
+            return true;
+        }
+        if (monotonic_milliseconds() >= deadline) {
+            return false;
+        }
+        sleep_milliseconds(10);
+    }
+}
+
 static bool
 wait_for_encoded_frames(kittyfb_session *session, uint64_t minimum)
 {
@@ -769,6 +929,7 @@ test_pty_lifecycle(void)
 
     kittyfb_session_init(&session);
     kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
     options.enter_sequence = "\x1b[?1003h";
     options.leave_sequence = "\x1b[?1003l";
     CHECK(start_with_fake_terminal(&session, master, slave, &options,
@@ -898,6 +1059,7 @@ test_pty_suspend_retains_buffers(void)
     CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
     kittyfb_session_init(&session);
     kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
     options.probe_graphics = false;
     CHECK(kittyfb_start(&session, slave, slave, &options) == 0);
     drain_descriptor(master);
@@ -1009,6 +1171,7 @@ test_pty_probe_disabled_starts_blind(void)
 
     kittyfb_session_init(&session);
     kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
     options.probe_graphics = false;
     (void)memset(overlong, 'x', sizeof(overlong));
     overlong[sizeof(overlong) - 1u] = '\0';
@@ -1064,6 +1227,7 @@ test_pty_emergency_restore(void)
 
     kittyfb_session_init(&session);
     kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
     options.enter_sequence = "\x1b[?1006h";
     options.leave_sequence = "\x1b[?1006l";
     CHECK(start_with_fake_terminal(&session, master, slave, &options,
@@ -1145,6 +1309,267 @@ test_pty_resize(void)
     return true;
 }
 
+static bool
+test_pty_shm_transport(void)
+{
+    enum { FRAME_W = 32, FRAME_H = 16 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame_a[(size_t)FRAME_W * FRAME_H * 4u];
+    static uint8_t frame_b[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[65536];
+    char name_a[128];
+    char name_b[128];
+    char name_c[128];
+    size_t used;
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_SHM;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+
+    /* Where shared memory is unavailable (no /dev/shm, or a sandbox that
+     * denies it) the library falls back rather than failing the start,
+     * and there is nothing for this test to assert. */
+    if (kittyfb_active_transport(&session) != KITTYFB_TRANSPORT_SHM) {
+        /* Say so loudly: a silently skipped test that prints "ok" is
+         * indistinguishable from one that verified something. */
+        (void)fprintf(stderr,
+                      "  SKIPPED: shared memory unavailable in this "
+                      "environment\n");
+        kittyfb_stop(&session);
+        (void)close(master);
+        (void)close(slave);
+        return true;
+    }
+
+    drain_descriptor(master);
+
+    /* First frame: id 1, deletes id 2, and the pixels arrive through
+     * shared memory rather than the escape stream. */
+    CHECK(present_and_capture(&session, master, frame_a, FRAME_W, FRAME_H, 0u,
+                              buffer, sizeof(buffer), &used));
+    CHECK(starts_with(buffer, used, "\x1b[?2026h\x1b[1;1H"));
+    CHECK(contains_str(buffer, used, "\x1b_Ga=T,f=32,i=1,q=2,t=s,s=32,v=16;"));
+    CHECK(contains_str(buffer, used, "\x1b_Ga=d,d=I,i=2,q=2\x1b\\"));
+    CHECK(!contains_str(buffer, used, "o=z"));
+
+    /* The whole frame costs a few hundred bytes of escape stream instead
+     * of a compressed copy of every pixel.  This is the reason the
+     * transport exists, so assert it rather than trusting it. */
+    CHECK(used < (size_t)FRAME_W * FRAME_H * 3u);
+    CHECK(extract_shm_name(buffer, used, name_a, sizeof(name_a)));
+
+    /* Second frame while the first is still unread: it must land in a
+     * different slot, or the terminal would be handed an object whose
+     * contents changed under it. */
+    CHECK(present_and_capture(&session, master, frame_b, FRAME_W, FRAME_H, 3u,
+                              buffer, sizeof(buffer), &used));
+    CHECK(contains_str(buffer, used, "\x1b_Ga=T,f=32,i=2,q=2,t=s,s=32,v=16;"));
+    CHECK(contains_str(buffer, used, "\x1b_Ga=d,d=I,i=1,q=2\x1b\\"));
+    CHECK(extract_shm_name(buffer, used, name_b, sizeof(name_b)));
+    CHECK(strcmp(name_b, name_a) != 0);
+
+    /* Both objects are still live and hold their own frame's pixels. */
+    CHECK(consume_shm_frame(name_a, frame_a, FRAME_W, FRAME_H));
+    CHECK(consume_shm_frame(name_b, frame_b, FRAME_W, FRAME_H));
+
+    /* Consumption is an unlink, so the slot is reaped and its name comes
+     * back round.  Recycling a name is safe: it creates a NEW object,
+     * and the terminal's mapping of the old one stays valid. */
+    CHECK(present_and_capture(&session, master, frame_a, FRAME_W, FRAME_H, 7u,
+                              buffer, sizeof(buffer), &used));
+    CHECK(extract_shm_name(buffer, used, name_c, sizeof(name_c)));
+    CHECK(strcmp(name_c, name_a) == 0);
+    CHECK(consume_shm_frame(name_c, frame_a, FRAME_W, FRAME_H));
+
+    CHECK(wait_for_encoded_frames(&session, 3u));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.frames_encoded == 3u);
+    CHECK(stats.encode_failures == 0u);
+    CHECK(!kittyfb_failed(&session));
+
+    /* A frame presented but never consumed leaves a live object behind,
+     * which teardown must clean up. */
+    CHECK(present_and_capture(&session, master, frame_b, FRAME_W, FRAME_H, 9u,
+                              buffer, sizeof(buffer), &used));
+    CHECK(extract_shm_name(buffer, used, name_b, sizeof(name_b)));
+    CHECK(shm_open(name_b, O_RDONLY, 0) >= 0);
+
+    kittyfb_stop(&session);
+    /* Teardown unlinks every slot, consumed or not: a slot left behind
+     * leaks a frame of tmpfs until the next reboot. */
+    CHECK(shm_open(name_b, O_RDONLY, 0) < 0);
+
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
+static bool
+test_pty_shm_saturation_drops(void)
+{
+    enum { FRAME_W = 16, FRAME_H = 8, SLOTS = 2 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[65536];
+    size_t used;
+    int attempt;
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_SHM;
+    options.shm_slots = SLOTS;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    if (kittyfb_active_transport(&session) != KITTYFB_TRANSPORT_SHM) {
+        /* Say so loudly: a silently skipped test that prints "ok" is
+         * indistinguishable from one that verified something. */
+        (void)fprintf(stderr,
+                      "  SKIPPED: shared memory unavailable in this "
+                      "environment\n");
+        kittyfb_stop(&session);
+        (void)close(master);
+        (void)close(slave);
+        return true;
+    }
+    drain_descriptor(master);
+
+    /* Never unlink: this terminal accepts frames and never reads them,
+     * so the ring fills and stays full. */
+    for (attempt = 0; attempt < SLOTS + 4; ++attempt) {
+        used = 0u;
+        CHECK(kittyfb_present(&session, frame, FRAME_W, FRAME_H));
+        (void)wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                             "\x1b[?2026l", 8u);
+        sleep_milliseconds(20);
+    }
+
+    /* A saturated ring drops the newest frame - the same bargain the
+     * pending slot already makes - and must NOT latch a failure, which
+     * would stop the session for what is a transient condition. */
+    CHECK(wait_for_dropped_frames(&session, 1u));
+    CHECK(!kittyfb_failed(&session));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.encode_failures == 0u);
+    CHECK(stats.frames_encoded <= (uint64_t)SLOTS);
+
+    /* Presenting still succeeds afterwards: dropping is not failing. */
+    CHECK(kittyfb_present(&session, frame, FRAME_W, FRAME_H));
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
+static bool
+test_shm_auto_declines_under_tmux(void)
+{
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    char *saved = getenv("TMUX");
+    char preserved[256];
+    bool had_tmux = saved != NULL;
+
+    if (had_tmux) {
+        (void)snprintf(preserved, sizeof(preserved), "%s", saved);
+    }
+    CHECK(setenv("TMUX", "/tmp/tmux-1000/default,1234,0", 1) == 0);
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_AUTO;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+
+    /* tmux forwards the escape to a terminal that need not share this
+     * process's /dev/shm, and a name it cannot open is a blank screen
+     * rather than a degraded one.  AUTO must decline. */
+    CHECK(kittyfb_active_transport(&session) == KITTYFB_TRANSPORT_INLINE);
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+
+    if (had_tmux) {
+        CHECK(setenv("TMUX", preserved, 1) == 0);
+    } else {
+        CHECK(unsetenv("TMUX") == 0);
+    }
+    return true;
+}
+
+static bool
+test_shm_reap_orphans(void)
+{
+    /* A process that dies without unwinding leaves its frames behind.
+     * Reaping must remove exactly those, and must not touch an object
+     * whose owner is still running - this process. */
+    char dead_name[64];
+    char live_name[64];
+    long dead_pid = 0;
+    int fd;
+    int reaped;
+
+    /* Find a pid that does not exist, so the object looks abandoned. */
+    for (long candidate = 4194303L; candidate > 1L; --candidate) {
+        if (kill((pid_t)candidate, 0) != 0 && errno == ESRCH) {
+            dead_pid = candidate;
+            break;
+        }
+    }
+    if (dead_pid == 0) {
+        (void)fprintf(stderr, "  SKIPPED: no free pid to impersonate\n");
+        return true;
+    }
+
+    (void)snprintf(dead_name, sizeof(dead_name), "/kilix-fb-%ld-0-0",
+                   dead_pid);
+    (void)snprintf(live_name, sizeof(live_name), "/kilix-fb-%ld-0-0",
+                   (long)getpid());
+    (void)shm_unlink(dead_name);
+    (void)shm_unlink(live_name);
+
+    fd = shm_open(dead_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        (void)fprintf(stderr,
+                      "  SKIPPED: shared memory unavailable in this "
+                      "environment\n");
+        return true;
+    }
+    CHECK(close(fd) == 0);
+    fd = shm_open(live_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    CHECK(fd >= 0);
+    CHECK(close(fd) == 0);
+
+    reaped = kittyfb_reap_orphans();
+    CHECK(reaped >= 1);
+
+    /* The abandoned one is gone; the live owner's survives. */
+    CHECK(shm_open(dead_name, O_RDONLY, 0) < 0);
+    fd = shm_open(live_name, O_RDONLY, 0);
+    CHECK(fd >= 0);
+    CHECK(close(fd) == 0);
+    CHECK(shm_unlink(live_name) == 0);
+    return true;
+}
+
 typedef bool (*test_function)(void);
 
 typedef struct test_case {
@@ -1161,6 +1586,7 @@ main(void)
         {"geometry small-terminal clamps", test_geometry_small_terminal_clamps},
         {"packet chunk boundaries", test_packet_chunk_boundaries},
         {"packet wrapper and delete", test_packet_wrapper_and_delete},
+        {"shm packet shape", test_shm_packet_shape},
         {"options defaults", test_options_defaults},
         {"inactive session is safe", test_inactive_session_is_safe},
         {"failure snapshot is synchronized",
@@ -1173,7 +1599,11 @@ main(void)
         {"PTY probe disabled starts blind",
          test_pty_probe_disabled_starts_blind},
         {"PTY emergency restore", test_pty_emergency_restore},
-        {"PTY resize", test_pty_resize}
+        {"PTY resize", test_pty_resize},
+        {"PTY shm transport", test_pty_shm_transport},
+        {"PTY shm saturation drops", test_pty_shm_saturation_drops},
+        {"shm AUTO declines under tmux", test_shm_auto_declines_under_tmux},
+        {"shm reap orphans", test_shm_reap_orphans}
     };
     size_t passed = 0u;
     size_t index;

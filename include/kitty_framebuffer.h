@@ -27,9 +27,39 @@ extern "C" {
 #endif
 
 #define KITTYFB_VERSION_MAJOR 0
-#define KITTYFB_VERSION_MINOR 2
+#define KITTYFB_VERSION_MINOR 3
 #define KITTYFB_VERSION_PATCH 0
 #define KITTYFB_CONTROL_SEQUENCE_MAX 64
+
+/*
+ * How frame pixels reach the terminal.
+ *
+ * INLINE zlib-compresses and base64-encodes every frame into the escape
+ * stream.  It works over ssh and through tmux, and it is the only choice
+ * when the terminal does not share a filesystem with this process.  It
+ * also costs a full compressed copy of every frame in terminal input:
+ * photographic content compresses poorly, so a 640x360 frame is ~600 KB
+ * of escape stream however fast the encoder is.
+ *
+ * SHM writes pixels into a POSIX shared-memory object and sends only its
+ * name (t=s).  The terminal unlinks the object once it has read it, which
+ * is the consumption acknowledgement a bounded ring of slots is built on.
+ * The escape stream carries tens of bytes per frame instead of hundreds
+ * of kilobytes.  It requires a local terminal sharing /dev/shm.
+ *
+ * AUTO picks SHM when shm_open() works and the session is not running
+ * under tmux, and INLINE otherwise.  The choice is made once, in
+ * kittyfb_start(), and does not change for the life of the session.
+ */
+typedef enum kittyfb_transport {
+    KITTYFB_TRANSPORT_AUTO = 0,
+    KITTYFB_TRANSPORT_INLINE,
+    KITTYFB_TRANSPORT_SHM
+} kittyfb_transport;
+
+/* Opaque; the session holds an array of these when the shared-memory
+ * transport is active. */
+struct kittyfb_shm_slot;
 
 typedef struct kittyfb_options {
     /* Save termios and switch the input descriptor's terminal to raw
@@ -91,8 +121,18 @@ typedef struct kittyfb_options {
 
     /* zlib compression level, -1 (zlib default) or 0..9.  Level 1 is
      * fast enough to encode full frames at game frame rates and is the
-     * default. */
+     * default.  Unused by the shared-memory transport, which does not
+     * compress. */
     int zlib_level;
+
+    /* Frame transport; see kittyfb_transport.  Default AUTO. */
+    kittyfb_transport transport;
+
+    /* Shared-memory slots in flight.  A frame arriving while every slot
+     * is still unread is dropped, exactly as a frame arriving while the
+     * encoder is busy is dropped; more slots tolerate a slower terminal
+     * before that happens.  1..16, default 3.  Ignored by INLINE. */
+    int shm_slots;
 } kittyfb_options;
 
 typedef struct kittyfb_stats {
@@ -157,6 +197,12 @@ typedef struct kittyfb_session {
     size_t packet_capacity;
     int shown_image_id;
 
+    /* shared-memory transport; presenter thread (or the synchronous
+     * fallback) only, except for teardown under kittyfb_stop() */
+    struct kittyfb_shm_slot *shm_slots;
+    int shm_slot_count;
+    bool shm_active;
+
     /* prebuilt restore sequence for the async-signal path */
     char emergency[224];
     size_t emergency_length;
@@ -187,6 +233,14 @@ int kittyfb_start(
     int input_fd,
     int output_fd,
     const kittyfb_options *options);
+
+/*
+ * The transport actually in use, resolved during kittyfb_start().  Never
+ * returns AUTO: it reports what AUTO decided, and reports INLINE when an
+ * explicit SHM request could not be honored (no /dev/shm, or a container
+ * that denies it).  Meaningful only while the session is active.
+ */
+kittyfb_transport kittyfb_active_transport(const kittyfb_session *session);
 
 /* Chosen framebuffer pixel size and terminal cell pixel size.  Valid
  * after a successful start; call from the thread that presents. */
@@ -223,6 +277,21 @@ bool kittyfb_check_resize(kittyfb_session *session, int *width, int *height);
 /* Flag a pending resize from an application-owned SIGWINCH handler.
  * Async-signal-safe. */
 void kittyfb_notify_resize(void);
+
+/*
+ * Unlink shared-memory frames left behind by processes that died without
+ * unwinding, and return how many were removed.  Objects owned by a live
+ * process are never touched, so this is safe to call while other
+ * sessions are running.
+ *
+ * Optional, and only useful on systems that expose shared memory as a
+ * directory (Linux); elsewhere it returns 0.  Call it at startup if the
+ * application is long-lived or crash-prone.  A normal kittyfb_stop()
+ * already releases this session's objects, and an emergency restore
+ * deliberately leaves them for a later call rather than doing filesystem
+ * work in a signal handler.
+ */
+int kittyfb_reap_orphans(void);
 
 /*
  * Join the presenter and restore the terminal while retaining all

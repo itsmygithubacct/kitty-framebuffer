@@ -3,9 +3,7 @@
 `kitty-framebuffer` is a small C11 library that presents RGBA framebuffers
 in a terminal through the [Kitty graphics
 protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/). Hand it a
-frame; it strips the alpha channel, zlib-compresses the pixels, base64
-encodes them into 4 KB graphics escapes and writes the whole frame in a
-single burst, wrapped in a DEC 2026 synchronized update.
+frame; it gets to the terminal, wrapped in a DEC 2026 synchronized update.
 
 Encoding and the terminal write run on a presenter thread with a
 newest-frame-wins pending slot, so a slow terminal connection costs
@@ -13,6 +11,45 @@ dropped frames, never a stalled render loop. Two image ids alternate
 between frames - the new frame is transmitted under the id not on screen,
 then the old id is deleted - so the screen never shows a blank or
 half-decoded state.
+
+## Transports
+
+How the pixels travel is a choice, and it matters more than it sounds.
+
+- **Shared memory (`t=s`)** writes the frame into a POSIX shared-memory
+  object and sends only its *name*. The terminal unlinks the object once
+  it has read it, and that unlink is the acknowledgement a bounded ring
+  of slots is built on. A frame costs a `memcpy` and a few dozen bytes of
+  escape stream. Requires a local terminal sharing `/dev/shm`.
+- **Inline (`t=d,o=z`)** zlib-compresses the frame, strips the alpha
+  channel and base64-encodes the result into 4 KB graphics escapes. It
+  works anywhere - over ssh, through tmux - and it is the only choice
+  when the terminal does not share this process's memory.
+
+Inline costs a compressed copy of every frame in terminal input, and
+photographic content barely compresses: a 640x360 camera frame measured
+66% of its raw size after zlib, or ~600 KB of escape stream per frame
+however fast the encoder runs. For a game canvas the waste is tolerable;
+for video it is the whole budget.
+
+`options.transport` selects between them and defaults to
+`KITTYFB_TRANSPORT_AUTO`, which picks shared memory when `shm_open()`
+works and the session is not under tmux, and inline otherwise. The
+decision is made once, in `kittyfb_start()`;
+`kittyfb_active_transport()` reports what it chose. tmux disqualifies
+shared memory even when `shm_open()` succeeds, because tmux forwards the
+escape to a terminal that need not share this process's `/dev/shm` - and
+a name the terminal cannot open is a blank screen, not a degraded one.
+
+`options.shm_slots` (default 3) bounds how many frames may be in flight.
+A frame arriving when every slot is still unread is dropped and counted
+in `stats.frames_dropped`, exactly as a frame arriving while the encoder
+is busy is dropped. Dropping is not failing: the session continues.
+
+A process killed without unwinding leaves its objects behind. Names embed
+the owning pid, so `kittyfb_reap_orphans()` can remove the ones whose
+owner is gone without touching a running session's frames. A normal
+`kittyfb_stop()` already releases this session's objects.
 
 The library is presentation only. Keyboard input is a separate concern;
 compose it with an input library (see the note on `kitty-keyboard` below)
