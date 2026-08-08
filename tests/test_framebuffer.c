@@ -1309,6 +1309,209 @@ test_pty_resize(void)
     return true;
 }
 
+
+/* Does the captured escape stream contain this literal? */
+static bool wire_has(const char *buffer, size_t used, const char *needle)
+{
+    size_t n = strlen(needle);
+
+    if (n == 0u || used < n) {
+        return false;
+    }
+    for (size_t i = 0u; i + n <= used; ++i) {
+        if (memcmp(buffer + i, needle, n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Damage presents patch the image already on screen instead of
+ * retransmitting it.  These check the wire, because what goes over it is
+ * the entire point.
+ */
+static bool
+test_pty_damage_patches_in_place(void)
+{
+    enum { FRAME_W = 64, FRAME_H = 48 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[262144];
+    size_t full_used = 0u;
+    size_t patch_used = 0u;
+    kittyfb_rect rect;
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+
+    /* A full frame first: there has to be an image to edit. */
+    CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
+                              buffer, sizeof(buffer), &full_used));
+    CHECK(wire_has(buffer, full_used, "a=T"));
+
+    /* Now change the frame and send only a small rectangle of it. */
+    fill_test_frame(frame, FRAME_W, FRAME_H, 2u);
+    rect.x0 = 8;
+    rect.y0 = 4;
+    rect.x1 = 20;
+    rect.y1 = 12;
+    CHECK(kittyfb_present_damage(&session, frame, FRAME_W, FRAME_H, &rect, 1u));
+    patch_used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &patch_used,
+                         "\x1b[?2026l", 8u));
+
+    /* The edit form, where it lands, and its own dimensions. */
+    CHECK(wire_has(buffer, patch_used, "a=f"));
+    CHECK(wire_has(buffer, patch_used, "r=1"));
+    CHECK(wire_has(buffer, patch_used, "x=8"));
+    CHECK(wire_has(buffer, patch_used, "y=4"));
+    CHECK(wire_has(buffer, patch_used, "s=12"));
+    CHECK(wire_has(buffer, patch_used, "v=8"));
+    /* Wrapped, so the screen never shows a half-applied edit. */
+    CHECK(wire_has(buffer, patch_used, "\x1b[?2026h"));
+    /* And nothing was transmitted as a new image. */
+    CHECK(!wire_has(buffer, patch_used, "a=T"));
+
+    /* The reason the function exists: a small patch must cost far less
+     * than the frame it patches. */
+    CHECK(patch_used * 4u < full_used);
+
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_presents == 1u);
+    CHECK(stats.damage_fallbacks == 0u);
+    CHECK(stats.damage_bytes > 0u);
+
+    kittyfb_stop(&session);
+    (void)close(master);
+    (void)close(slave);
+    return true;
+}
+
+/* Falling back rather than refusing is what lets a caller use this
+ * unconditionally instead of reasoning about when it pays. */
+static bool
+test_pty_damage_falls_back(void)
+{
+    enum { FRAME_W = 64, FRAME_H = 48 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[262144];
+    size_t used = 0u;
+    kittyfb_rect rect;
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+    fill_test_frame(frame, FRAME_W, FRAME_H, 3u);
+
+    /* Nothing on screen yet, so there is no image to edit: transmit. */
+    rect.x0 = 0;
+    rect.y0 = 0;
+    rect.x1 = 8;
+    rect.y1 = 8;
+    CHECK(kittyfb_present_damage(&session, frame, FRAME_W, FRAME_H, &rect, 1u));
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=T"));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_fallbacks == 1u);
+    CHECK(stats.damage_presents == 0u);
+
+    /* Damage covering the whole frame is cheaper sent whole. */
+    rect.x1 = FRAME_W;
+    rect.y1 = FRAME_H;
+    CHECK(kittyfb_present_damage(&session, frame, FRAME_W, FRAME_H, &rect, 1u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=T"));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_fallbacks == 2u);
+
+    kittyfb_stop(&session);
+    (void)close(master);
+    (void)close(slave);
+    return true;
+}
+
+static bool
+test_pty_damage_rect_handling(void)
+{
+    enum { FRAME_W = 64, FRAME_H = 48 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[262144];
+    size_t used = 0u;
+    kittyfb_rect rects[4];
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+    CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 4u,
+                              buffer, sizeof(buffer), &used));
+
+    /* No rects is not an error: a frame where nothing changed needs no
+     * write, and making every caller check would spread that everywhere. */
+    CHECK(kittyfb_present_damage(&session, frame, FRAME_W, FRAME_H, NULL, 0u));
+    CHECK(kittyfb_present_damage(&session, frame, FRAME_W, FRAME_H, rects, 0u));
+
+    /* Empty and inverted rects are skipped rather than rejected: a caller
+     * deriving damage from geometry should not special-case frame edges. */
+    rects[0].x0 = 5; rects[0].y0 = 5; rects[0].x1 = 5; rects[0].y1 = 9;
+    rects[1].x0 = 9; rects[1].y0 = 9; rects[1].x1 = 4; rects[1].y1 = 12;
+    CHECK(kittyfb_present_damage(&session, frame, FRAME_W, FRAME_H, rects, 2u));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_presents == 0u);
+    CHECK(stats.damage_fallbacks == 0u);
+
+    /* Out of bounds is clamped, not refused. */
+    rects[0].x0 = -10; rects[0].y0 = -10; rects[0].x1 = 6; rects[0].y1 = 6;
+    CHECK(kittyfb_present_damage(&session, frame, FRAME_W, FRAME_H, rects, 1u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "x=0"));
+    CHECK(wire_has(buffer, used, "y=0"));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_presents == 1u);
+
+    /* Bad arguments still fail. */
+    CHECK(!kittyfb_present_damage(NULL, frame, FRAME_W, FRAME_H, rects, 1u));
+    CHECK(!kittyfb_present_damage(&session, NULL, FRAME_W, FRAME_H, rects, 1u));
+    CHECK(!kittyfb_present_damage(&session, frame, 0, FRAME_H, rects, 1u));
+
+    kittyfb_stop(&session);
+    (void)close(master);
+    (void)close(slave);
+    return true;
+}
+
 static bool
 test_pty_shm_transport(void)
 {
@@ -1600,6 +1803,9 @@ main(void)
          test_pty_probe_disabled_starts_blind},
         {"PTY emergency restore", test_pty_emergency_restore},
         {"PTY resize", test_pty_resize},
+        {"PTY damage patches in place", test_pty_damage_patches_in_place},
+        {"PTY damage falls back", test_pty_damage_falls_back},
+        {"PTY damage rect handling", test_pty_damage_rect_handling},
         {"PTY shm transport", test_pty_shm_transport},
         {"PTY shm saturation drops", test_pty_shm_saturation_drops},
         {"shm AUTO declines under tmux", test_shm_auto_declines_under_tmux},

@@ -51,6 +51,13 @@
 #include <unistd.h>
 #include <zlib.h>
 
+/* Damage-present limits.  The fraction is where per-rect overhead and many
+ * small zlib streams stop being cheaper than one clean frame; the rect cap
+ * bounds the stack array and catches a caller handing over a scatter of
+ * damage that is really a full repaint. */
+#define KITTYFB_DAMAGE_MAX_FRACTION 0.35
+#define KITTYFB_DAMAGE_MAX_RECTS 64
+
 /* The probe never places an image (a=q is query-only), so this id cannot
  * collide with anything the application shows. */
 #define KITTYFB_PROBE_IMAGE_ID 31
@@ -1700,4 +1707,243 @@ void kittyfb_emergency_restore(kittyfb_session *session)
                     session->saved_output_flags);
     }
     session->active = 0;
+}
+
+/* ------------------------------ damage ---------------------------------- */
+
+/*
+ * Patch the image already on screen instead of re-sending it.
+ *
+ * kittyfb_present() alternates two image ids and transmits every pixel,
+ * which is right for video and wrong for an editor: moving a pointer
+ * changes a few hundred pixels, and a full 1080p frame is ~1.5 MB of
+ * escape stream per motion event.  kitty's a=f edits the root frame of an
+ * existing image in place at an x/y offset, so the wire cost follows the
+ * damage.
+ *
+ * Deliberately synchronous, unlike kittyfb_present().  The presenter
+ * thread keeps only the newest pending frame and drops the rest, which is
+ * correct for video - a dropped frame is one the viewer never needed - and
+ * corrupting for patches, because each one carries only its own
+ * rectangles.  A dropped patch leaves that region wrong on screen until
+ * something else happens to redraw it.  Patches are small, so writing
+ * them on the calling thread costs little and cannot drop.
+ */
+
+static bool damage_rect_valid(const kittyfb_rect *rect, int width, int height,
+                              kittyfb_rect *clamped)
+{
+    kittyfb_rect out = *rect;
+
+    if (out.x0 < 0) { out.x0 = 0; }
+    if (out.y0 < 0) { out.y0 = 0; }
+    if (out.x1 > width) { out.x1 = width; }
+    if (out.y1 > height) { out.y1 = height; }
+    /* Empty or inverted is skipped rather than rejected: a caller
+     * computing damage from geometry should not have to special-case the
+     * frame edges. */
+    if (out.x1 <= out.x0 || out.y1 <= out.y0) {
+        return false;
+    }
+    *clamped = out;
+    return true;
+}
+
+/* One a=f packet for one rectangle: RGB, zlib, base64, chunked. */
+static bool write_damage_rect(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    const kittyfb_rect *rect,
+    int image_id,
+    size_t *bytes_written)
+{
+    const int rect_width = rect->x1 - rect->x0;
+    const int rect_height = rect->y1 - rect->y0;
+    const size_t pixels = (size_t)rect_width * (size_t)rect_height;
+    const size_t rgb_length = pixels * 3u;
+    uLongf z_length;
+    size_t encoded_length;
+    size_t needed;
+    bool ok = true;
+
+    if (!grow_bytes(&session->rgb_buffer, &session->rgb_capacity, rgb_length)) {
+        return false;
+    }
+    /* Strip alpha while copying the sub-rectangle out of the full frame:
+     * one pass, and 25% less to compress. */
+    {
+        uint8_t *out = session->rgb_buffer;
+
+        for (int y = rect->y0; y < rect->y1; y++) {
+            const uint8_t *row = rgba + ((size_t)y * (size_t)width +
+                                         (size_t)rect->x0) * 4u;
+
+            for (int x = 0; x < rect_width; x++) {
+                *out++ = row[0];
+                *out++ = row[1];
+                *out++ = row[2];
+                row += 4;
+            }
+        }
+    }
+
+    z_length = compressBound((uLong)rgb_length);
+    if (!grow_bytes(&session->z_buffer, &session->z_capacity,
+                    (size_t)z_length)) {
+        return false;
+    }
+    if (compress2(session->z_buffer, &z_length, session->rgb_buffer,
+                  (uLong)rgb_length, session->options.zlib_level) != Z_OK) {
+        return false;
+    }
+
+    needed = ((size_t)z_length + 2u) / 3u * 4u + 1u;
+    if (!grow_chars(&session->b64_buffer, &session->b64_capacity,
+                    needed)) {
+        return false;
+    }
+    encoded_length = kittyfb_base64_encode(
+        session->z_buffer, (size_t)z_length, session->b64_buffer);
+
+    /* r=1 edits the root frame; x/y place the patch inside the existing
+     * image; s/v are the patch's own dimensions. */
+    {
+        size_t offset = 0u;
+        bool first = true;
+
+        while (offset < encoded_length) {
+            char header[192];
+            size_t count = encoded_length - offset;
+            int more;
+            int printed;
+
+            if (count > KITTYFB_CHUNK_SIZE) {
+                count = KITTYFB_CHUNK_SIZE;
+            }
+            more = offset + count < encoded_length ? 1 : 0;
+            if (first) {
+                printed = snprintf(
+                    header, sizeof(header),
+                    "\x1b_Ga=f,i=%d,r=1,q=2,f=24,o=z,x=%d,y=%d,s=%d,v=%d,m=%d;",
+                    image_id, rect->x0, rect->y0, rect_width, rect_height,
+                    more);
+                first = false;
+            } else {
+                printed = snprintf(header, sizeof(header), "\x1b_Gm=%d;", more);
+            }
+            if (printed < 0 || (size_t)printed >= sizeof(header)) {
+                return false;
+            }
+            ok = write_all(session, header, (size_t)printed) &&
+                 write_all(session, session->b64_buffer + offset, count) &&
+                 write_all(session, "\x1b\\", 2u);
+            if (!ok) {
+                return false;
+            }
+            *bytes_written += (size_t)printed + count + 2u;
+            offset += count;
+        }
+    }
+    return true;
+}
+
+bool kittyfb_present_damage(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    const kittyfb_rect *rects,
+    size_t rect_count)
+{
+    kittyfb_rect clamped[KITTYFB_DAMAGE_MAX_RECTS];
+    size_t usable = 0u;
+    size_t damaged_pixels = 0u;
+    size_t total_pixels;
+    int image_id;
+    bool nothing_on_screen;
+    size_t bytes = 0u;
+    bool ok = true;
+
+    if (session == NULL || !session->active || rgba == NULL ||
+        width <= 0 || height <= 0) {
+        return false;
+    }
+    if (rects == NULL || rect_count == 0u) {
+        return true;   /* nothing changed; not an error */
+    }
+    total_pixels = (size_t)width * (size_t)height;
+
+    for (size_t i = 0u; i < rect_count && usable < KITTYFB_DAMAGE_MAX_RECTS;
+         i++) {
+        kittyfb_rect fixed;
+
+        if (!damage_rect_valid(&rects[i], width, height, &fixed)) {
+            continue;
+        }
+        damaged_pixels += (size_t)(fixed.x1 - fixed.x0) *
+                          (size_t)(fixed.y1 - fixed.y0);
+        clamped[usable++] = fixed;
+    }
+    if (usable == 0u) {
+        return true;
+    }
+
+    pthread_mutex_lock(&session->frame_lock);
+    if (session->presenter_failed ||
+        (session->presenter_started && !session->presenter_running)) {
+        pthread_mutex_unlock(&session->frame_lock);
+        return false;
+    }
+    image_id = session->shown_image_id;
+    /* shown_image_id is pre-seeded at start, so it cannot distinguish
+     * "nothing presented yet" - only a completed encode can. */
+    nothing_on_screen = session->stats.frames_encoded == 0u;
+    pthread_mutex_unlock(&session->frame_lock);
+
+    /*
+     * Fall back when patching cannot help or cannot work:
+     *
+     *   - nothing on screen yet, so there is no frame to edit;
+     *   - the shared-memory transport hands the terminal a whole buffer
+     *     and has no per-rect form;
+     *   - too much changed, where per-rect overhead and many small zlib
+     *     streams cost more than one clean frame.
+     *
+     * Falling back rather than refusing is what lets a caller use this
+     * unconditionally instead of reasoning about when it pays.
+     */
+    if (nothing_on_screen || image_id == 0 ||
+        kittyfb_active_transport(session) == KITTYFB_TRANSPORT_SHM ||
+        (double)damaged_pixels >
+            (double)total_pixels * KITTYFB_DAMAGE_MAX_FRACTION ||
+        usable >= KITTYFB_DAMAGE_MAX_RECTS) {
+        pthread_mutex_lock(&session->frame_lock);
+        session->stats.damage_fallbacks++;
+        pthread_mutex_unlock(&session->frame_lock);
+        return kittyfb_present(session, rgba, width, height);
+    }
+
+    /* One synchronized update around every patch, so the screen never
+     * shows a half-applied edit. */
+    if (!write_all(session, "\x1b[?2026h", 8u)) {
+        return false;
+    }
+    for (size_t i = 0u; i < usable && ok; i++) {
+        ok = write_damage_rect(session, rgba, width, &clamped[i], image_id,
+                               &bytes);
+    }
+    if (!write_all(session, "\x1b[?2026l", 8u)) {
+        ok = false;
+    }
+
+    pthread_mutex_lock(&session->frame_lock);
+    if (ok) {
+        session->stats.damage_presents++;
+        session->stats.damage_bytes += bytes;
+    } else {
+        session->stats.encode_failures++;
+    }
+    pthread_mutex_unlock(&session->frame_lock);
+    return ok;
 }

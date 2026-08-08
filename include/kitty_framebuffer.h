@@ -140,6 +140,9 @@ typedef struct kittyfb_stats {
     uint64_t frames_encoded;    /* frames fully encoded and written */
     uint64_t frames_dropped;    /* pending frames replaced before encoding */
     uint64_t encode_failures;   /* compression, allocation, write failures */
+    uint64_t damage_presents;   /* kittyfb_present_damage() calls patched */
+    uint64_t damage_fallbacks;  /* ...and calls that fell back to a full frame */
+    uint64_t damage_bytes;      /* escape-stream bytes written by patches */
 } kittyfb_stats;
 
 /* Public so callers can allocate it without malloc; fields are internal. */
@@ -263,6 +266,57 @@ bool kittyfb_present(
     const uint8_t *rgba,
     int width,
     int height);
+
+/*
+ * A rectangle of the frame, in framebuffer pixels.  x1/y1 are exclusive.
+ */
+typedef struct kittyfb_rect {
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+} kittyfb_rect;
+
+/*
+ * Present only the parts of a frame that changed.
+ *
+ * kittyfb_present() re-transmits the whole image every time, which is
+ * right for video - where every pixel is new - and badly wrong for an
+ * interactive editor, where moving the pointer changes a few hundred
+ * pixels and a full 1920x1080 frame costs ~1.5 MB of escape stream per
+ * mouse motion.  This edits the image already on screen in place
+ * instead, so the wire cost follows what actually changed.
+ *
+ * `rgba` is the complete new frame, the same buffer kittyfb_present()
+ * would take; the rects say which parts of it to send.  Passing the
+ * whole frame rather than loose tiles keeps the caller's composition
+ * unchanged and lets this decide, from the damaged area, whether
+ * patching is even the cheaper option.
+ *
+ * Falls back to a full kittyfb_present() automatically when:
+ *
+ *   - nothing has been presented yet, so there is no image to edit;
+ *   - the damaged area exceeds a fraction of the frame where patching
+ *     stops paying (many small rects cost more in per-rect overhead than
+ *     one clean frame);
+ *   - the active transport cannot express an edit.
+ *
+ * That fallback is why a caller can use this unconditionally and does
+ * not have to reason about when it helps.
+ *
+ * Returns false on invalid arguments, an inactive session, or a latched
+ * presenter failure.  Rects are clamped to the framebuffer; empty or
+ * inverted ones are skipped rather than rejected, because a caller
+ * computing damage from geometry should not have to special-case the
+ * frame edges.
+ */
+bool kittyfb_present_damage(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    const kittyfb_rect *rects,
+    size_t rect_count);
 
 /*
  * Re-read the terminal size and re-derive the framebuffer geometry.

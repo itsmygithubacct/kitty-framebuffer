@@ -55,6 +55,37 @@ The library is presentation only. Keyboard input is a separate concern;
 compose it with an input library (see the note on `kitty-keyboard` below)
 or plain `read()` calls.
 
+
+## Damage presents
+
+`kittyfb_present()` retransmits every pixel, which is right for video and wrong
+for an interactive editor: moving a pointer changes a few hundred pixels, and a
+full 1080p frame is ~1.5 MB of escape stream per motion event.
+
+`kittyfb_present_damage()` edits the image already on screen in place, using
+kitty's `a=f` frame edits, so the wire cost follows what actually changed.
+
+```c
+kittyfb_rect damage[2] = { {x0, y0, x1, y1}, ... };
+kittyfb_present_damage(&session, rgba, width, height, damage, 2);
+```
+
+It takes the **whole** frame plus the rects that changed, not loose tiles — so
+the caller's composition is unchanged, and the library can decide from the
+damaged area whether patching is even the cheaper option.
+
+It falls back to a full present automatically when nothing has been presented
+yet, when the shared-memory transport is active (which has no per-rect form), or
+when the damage covers enough of the frame that per-rect overhead costs more
+than one clean transmission. That fallback is the point: a caller can use it
+unconditionally instead of reasoning about when it helps.
+
+**It is synchronous, unlike `kittyfb_present()`.** The presenter thread keeps
+only the newest pending frame and drops the rest — correct for video, where a
+dropped frame is one nobody needed, and corrupting for patches, where each
+carries only its own rectangles and a dropped one leaves that region wrong until
+something else redraws it.
+
 ## Build and test
 
 ```sh
