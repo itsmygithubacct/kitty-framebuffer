@@ -523,6 +523,7 @@ void kittyfb_session_init(kittyfb_session *session)
     session->saved_output_flags = -1;
     (void)pthread_mutex_init(&session->frame_lock, NULL);
     (void)pthread_cond_init(&session->frame_cond, NULL);
+    (void)pthread_mutex_init(&session->output_lock, NULL);
 }
 
 int kittyfb_width(const kittyfb_session *session)
@@ -1034,6 +1035,10 @@ static void *presenter_main(void *opaque)
         pthread_mutex_unlock(&session->frame_lock);
 
         bool dropped = false;
+        /* Nothing else may write to the terminal while this frame goes
+         * out: a damage patch landing between two of its writes would
+         * interleave escape sequences. */
+        pthread_mutex_lock(&session->output_lock);
         bool encoded = encode_and_write(
             session,
             session->encode_buffer,
@@ -1042,6 +1047,7 @@ static void *presenter_main(void *opaque)
             origin,
             clear_first,
             &dropped);
+        pthread_mutex_unlock(&session->output_lock);
 
         pthread_mutex_lock(&session->frame_lock);
         if (encoded) {
@@ -1112,8 +1118,10 @@ bool kittyfb_present(
             session->stats.frames_presented++;
             pthread_mutex_unlock(&session->frame_lock);
             bool dropped = false;
+            pthread_mutex_lock(&session->output_lock);
             bool encoded = encode_and_write(
                 session, rgba, width, height, origin, clear_first, &dropped);
+            pthread_mutex_unlock(&session->output_lock);
             pthread_mutex_lock(&session->frame_lock);
             if (encoded) {
                 session->stats.frames_encoded++;
@@ -1649,6 +1657,12 @@ void kittyfb_stop(kittyfb_session *session)
     if (session == NULL) {
         return;
     }
+    /* Under the lock: the presenter swaps pending_buffer and
+     * encode_buffer while it runs, and this reads both before joining
+     * it.  Whether either is NULL is unchanged by a swap, so the answer
+     * was never wrong - but it was still an unsynchronized read, and one
+     * that a thread sanitizer is right to refuse. */
+    pthread_mutex_lock(&session->frame_lock);
     restore = session->active || session->presenter_started;
     retained =
         session->pending_buffer != NULL ||
@@ -1657,6 +1671,7 @@ void kittyfb_stop(kittyfb_session *session)
         session->z_buffer != NULL ||
         session->b64_buffer != NULL ||
         session->packet_buffer != NULL;
+    pthread_mutex_unlock(&session->frame_lock);
     if (!restore && !retained) return;
     /* Stop the presenter first so no frame write interleaves with the
      * restore sequence.  This also reclaims the thread and buffers after
@@ -1873,6 +1888,7 @@ bool kittyfb_present_damage(
     size_t total_pixels;
     int image_id;
     bool nothing_on_screen;
+    bool frame_queued;
     size_t bytes = 0u;
     bool ok = true;
 
@@ -1900,22 +1916,44 @@ bool kittyfb_present_damage(
         return true;
     }
 
+    /*
+     * Taken before anything is decided, and held until the patch is
+     * fully written.  It does two jobs at once.
+     *
+     * It keeps this burst from interleaving with a frame the presenter
+     * is writing right now - two threads calling write() on one terminal
+     * would splice their escape sequences together.
+     *
+     * And because the presenter holds it for the whole of a frame,
+     * owning it means no frame is in flight, so frame_pending read just
+     * below is a reliable answer to "is an older frame still queued".
+     * It would not be otherwise: a frame taken off the pending slot is
+     * no longer pending but has not yet reached the terminal.
+     */
+    pthread_mutex_lock(&session->output_lock);
     pthread_mutex_lock(&session->frame_lock);
     if (session->presenter_failed ||
         (session->presenter_started && !session->presenter_running)) {
         pthread_mutex_unlock(&session->frame_lock);
+        pthread_mutex_unlock(&session->output_lock);
         return false;
     }
     image_id = session->shown_image_id;
     /* shown_image_id is pre-seeded at start, so it cannot distinguish
      * "nothing presented yet" - only a completed encode can. */
     nothing_on_screen = session->stats.frames_encoded == 0u;
+    frame_queued = session->frame_pending;
     pthread_mutex_unlock(&session->frame_lock);
 
     /*
      * Fall back when patching cannot help or cannot work:
      *
      *   - nothing on screen yet, so there is no frame to edit;
+     *   - a frame is already queued.  Patching now would put newer
+     *     pixels on screen and then let the older frame overwrite them,
+     *     and the screen would stay wrong until something else changed.
+     *     Replacing that frame instead is the same newest-wins bargain
+     *     the pending slot already makes;
      *   - the shared-memory transport hands the terminal a whole buffer
      *     and has no per-rect form;
      *   - too much changed, where per-rect overhead and many small zlib
@@ -1924,7 +1962,7 @@ bool kittyfb_present_damage(
      * Falling back rather than refusing is what lets a caller use this
      * unconditionally instead of reasoning about when it pays.
      */
-    if (nothing_on_screen || image_id == 0 ||
+    if (nothing_on_screen || frame_queued || image_id == 0 ||
         kittyfb_active_transport(session) == KITTYFB_TRANSPORT_SHM ||
         (double)damaged_pixels >
             (double)total_pixels * KITTYFB_DAMAGE_MAX_FRACTION ||
@@ -1932,6 +1970,9 @@ bool kittyfb_present_damage(
         pthread_mutex_lock(&session->frame_lock);
         session->stats.damage_fallbacks++;
         pthread_mutex_unlock(&session->frame_lock);
+        /* Released first: the fallback can encode synchronously, and
+         * that path takes this same lock. */
+        pthread_mutex_unlock(&session->output_lock);
         return kittyfb_present(session, rgba, width, height);
     }
 
@@ -1947,6 +1988,7 @@ bool kittyfb_present_damage(
     if (!write_all(session, "\x1b[?2026l", 8u)) {
         ok = false;
     }
+    pthread_mutex_unlock(&session->output_lock);
 
     pthread_mutex_lock(&session->frame_lock);
     if (ok) {

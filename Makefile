@@ -22,7 +22,7 @@ SHARED_LIB := $(BUILD_DIR)/lib$(PROJECT).so
 TEST_BIN := $(BUILD_DIR)/test-framebuffer
 EXAMPLE_BIN := $(BUILD_DIR)/bounce
 
-.PHONY: all clean install sanitize test
+.PHONY: all clean install sanitize race test
 
 all: $(STATIC_LIB) $(SHARED_LIB) $(EXAMPLE_BIN)
 
@@ -55,6 +55,18 @@ sanitize: | $(BUILD_DIR)
 		-o $(BUILD_DIR)/test-framebuffer-sanitize
 	ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
 		$(BUILD_DIR)/test-framebuffer-sanitize
+
+# Separate from `sanitize` because thread and address sanitizers cannot be
+# combined.  The presenter runs on its own thread and damage patches are
+# written from the caller's, so the interesting failures here are races.
+race: | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -Isrc -std=c11 -O1 -g3 -pthread $(WARNINGS) \
+		-fno-omit-frame-pointer -fsanitize=thread \
+		src/kitty_framebuffer.c tests/test_framebuffer.c \
+		$(LDLIBS) -lutil -fsanitize=thread \
+		-o $(BUILD_DIR)/test-framebuffer-race
+	TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 \
+		$(BUILD_DIR)/test-framebuffer-race
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib

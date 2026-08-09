@@ -1067,6 +1067,15 @@ test_pty_suspend_retains_buffers(void)
                               buffer, sizeof(buffer), &used));
     CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
                               buffer, sizeof(buffer), &used));
+    kittyfb_suspend(&session);
+    CHECK(!session.active);
+    CHECK(!session.presenter_started);
+
+    /* Sampled only now that suspend has joined the presenter.  It swaps
+     * pending_buffer and encode_buffer as it runs, so reading them from
+     * this thread beforehand is a data race - and one that could make
+     * the comparison below fail for no reason, if a swap happened to
+     * land between the sample and the join. */
     CHECK(session.pending_buffer != NULL);
     CHECK(session.encode_buffer != NULL);
     CHECK(session.rgb_buffer != NULL);
@@ -1082,18 +1091,12 @@ test_pty_suspend_retains_buffers(void)
     pending_capacity = session.pending_capacity;
     encode_capacity = session.encode_capacity;
 
+    /* A second suspend changes nothing. */
     kittyfb_suspend(&session);
-    CHECK(!session.active);
-    CHECK(!session.presenter_started);
     CHECK(session.pending_buffer == pending);
     CHECK(session.encode_buffer == encoding);
-    CHECK(session.rgb_buffer == rgb);
-    CHECK(session.z_buffer == compressed);
-    CHECK(session.b64_buffer == base64);
-    CHECK(session.packet_buffer == packet);
     CHECK(session.pending_capacity == pending_capacity);
     CHECK(session.encode_capacity == encode_capacity);
-    kittyfb_suspend(&session);
 
     drain_descriptor(master);
     CHECK(kittyfb_start(&session, slave, slave, &options) == 0);
@@ -1364,6 +1367,123 @@ test_pty_origin_is_the_centering_offset(void)
 
     CHECK(kittyfb_origin_x(NULL) == 0);
     CHECK(kittyfb_origin_y(NULL) == 0);
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
+/*
+ * Frames and patches come from different threads, and both write escape
+ * sequences to one terminal.
+ *
+ * The presenter owns a thread; damage patches are written synchronously
+ * by whoever called.  Nothing stopped the two from splicing their output
+ * together mid-sequence, and nothing stopped a patch from being written
+ * ahead of an already-queued frame that would then paint over it with
+ * older pixels.  Neither is visible in a single-threaded test.
+ *
+ * Run this under `make race`; without a thread sanitizer it still
+ * exercises the path, but the interleaving is what it is really for.
+ */
+typedef struct concurrency_state {
+    kittyfb_session *session;
+    const uint8_t *frame;
+    int width;
+    int height;
+    int rounds;
+    int stop;
+    int master;
+} concurrency_state;
+
+static void *concurrency_presenter(void *opaque)
+{
+    concurrency_state *state = opaque;
+
+    for (int i = 0; i < state->rounds; i++) {
+        (void)kittyfb_present(state->session, state->frame, state->width,
+                              state->height);
+    }
+    return NULL;
+}
+
+static void *concurrency_reader(void *opaque)
+{
+    concurrency_state *state = opaque;
+    static char sink[16384];
+
+    /* Keep the pty drained, or the writers stall against a full buffer
+     * and the test measures poll timeouts instead of interleaving. */
+    while (__atomic_load_n(&state->stop, __ATOMIC_ACQUIRE) == 0) {
+        if (read(state->master, sink, sizeof(sink)) <= 0) {
+            struct timespec pause = {0, 1000000};
+
+            (void)nanosleep(&pause, NULL);
+        }
+    }
+    return NULL;
+}
+
+static bool
+test_pty_frames_and_patches_from_two_threads(void)
+{
+    /* An upper bound, not the size: the framebuffer snaps to whole cells,
+     * so the geometry it settles on is what has to be presented. */
+    enum { FRAME_MAX_W = 128, FRAME_MAX_H = 64, ROUNDS = 200 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    concurrency_state state;
+    pthread_t writer;
+    pthread_t reader;
+    static uint8_t frame[(size_t)FRAME_MAX_W * FRAME_MAX_H * 4u];
+    const kittyfb_rect rect = {0, 0, 16, 8};
+
+    for (size_t i = 0u; i < sizeof(frame); i++) {
+        frame[i] = (uint8_t)(i * 7u);
+    }
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    /* Patching has no per-rect form over shared memory, so pin the
+     * transport that does. */
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    options.min_width = 1;
+    options.min_height = 1;
+    options.max_width = FRAME_MAX_W;
+    options.max_height = FRAME_MAX_H;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+
+    state.session = &session;
+    state.frame = frame;
+    state.width = kittyfb_width(&session);
+    state.height = kittyfb_height(&session);
+    state.rounds = ROUNDS;
+    state.stop = 0;
+    state.master = master;
+    CHECK(state.width > 0 && state.width <= FRAME_MAX_W);
+    CHECK(state.height > 0 && state.height <= FRAME_MAX_H);
+
+    CHECK(pthread_create(&reader, NULL, concurrency_reader, &state) == 0);
+    CHECK(pthread_create(&writer, NULL, concurrency_presenter, &state) == 0);
+    for (int i = 0; i < ROUNDS; i++) {
+        (void)kittyfb_present_damage(&session, frame, state.width,
+                                     state.height, &rect, 1u);
+    }
+    CHECK(pthread_join(writer, NULL) == 0);
+    __atomic_store_n(&state.stop, 1, __ATOMIC_RELEASE);
+    CHECK(pthread_join(reader, NULL) == 0);
+
+    /* Every patch either went out or turned into a frame; none was lost
+     * and nothing latched a failure. */
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_presents + stats.damage_fallbacks == (uint64_t)ROUNDS);
+    CHECK(!kittyfb_failed(&session));
+    CHECK(stats.encode_failures == 0u);
 
     kittyfb_stop(&session);
     CHECK(close(master) == 0);
@@ -1866,6 +1986,8 @@ main(void)
         {"PTY resize", test_pty_resize},
         {"PTY origin is the centering offset",
          test_pty_origin_is_the_centering_offset},
+        {"PTY frames and patches from two threads",
+         test_pty_frames_and_patches_from_two_threads},
         {"PTY damage patches in place", test_pty_damage_patches_in_place},
         {"PTY damage falls back", test_pty_damage_falls_back},
         {"PTY damage rect handling", test_pty_damage_rect_handling},

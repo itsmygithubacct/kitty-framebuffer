@@ -179,6 +179,10 @@ typedef struct kittyfb_session {
     pthread_t presenter_thread;
     pthread_mutex_t frame_lock;
     pthread_cond_t frame_cond;
+    /* Held for the length of one escape-stream burst, so a synchronous
+     * damage patch and the presenter's frame never interleave bytes on
+     * the terminal.  Never taken while frame_lock is held. */
+    pthread_mutex_t output_lock;
     uint8_t *pending_buffer;
     uint8_t *encode_buffer;
     size_t pending_capacity;
