@@ -156,6 +156,8 @@ typedef struct kittyfb_session {
     int height;
     int cell_width;
     int cell_height;
+    int origin_x;
+    int origin_y;
     char origin_sequence[32];
     bool clear_pending;
 
@@ -251,6 +253,22 @@ int kittyfb_width(const kittyfb_session *session);
 int kittyfb_height(const kittyfb_session *session);
 int kittyfb_cell_width(const kittyfb_session *session);
 int kittyfb_cell_height(const kittyfb_session *session);
+
+/*
+ * Where the frame's top-left corner sits inside the terminal, in pixels.
+ *
+ * The frame is centered rather than pinned to the corner, so terminal
+ * pixel coordinates and frame pixel coordinates differ by this much.
+ * Anything that reads a pointer position needs it: an SGR pixel-mouse
+ * report is relative to the terminal, and subtracting this turns it into
+ * a coordinate in the frame the application drew.
+ *
+ * Both are zero when the frame fills its axis, and both are multiples of
+ * the cell size, because a graphics placement starts at a cell boundary.
+ * Valid after a successful start, and updated by kittyfb_check_resize().
+ */
+int kittyfb_origin_x(const kittyfb_session *session);
+int kittyfb_origin_y(const kittyfb_session *session);
 
 /*
  * Queue one RGBA frame (width * height * 4 bytes, alpha ignored) for

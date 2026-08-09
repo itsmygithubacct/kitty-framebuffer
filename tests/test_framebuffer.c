@@ -1310,6 +1310,67 @@ test_pty_resize(void)
 }
 
 
+/*
+ * The frame is centered rather than pinned to a corner, so a pointer
+ * report - which the terminal gives relative to itself - is offset from
+ * the frame by however much of the terminal the frame does not fill.
+ * Without this exposed, a caller reading a mouse would have to
+ * re-implement the centering or parse it back out of an escape string.
+ */
+static bool
+test_pty_origin_is_the_centering_offset(void)
+{
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    struct winsize window;
+    int width = 0;
+    int height = 0;
+
+    /* Larger than the default maximum, so the frame is clamped and there
+     * is real terminal left over around it. */
+    CHECK(open_test_pty(&master, &slave, 300, 80, 3000, 1600, NULL));
+
+    kittyfb_session_init(&session);
+    CHECK(start_with_fake_terminal(&session, master, slave, NULL,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+    CHECK(kittyfb_width(&session) == 1600);
+    CHECK(kittyfb_height(&session) == 1000);
+    CHECK(kittyfb_cell_width(&session) == 10);
+    CHECK(kittyfb_cell_height(&session) == 20);
+
+    /* 71st column and 15th row, one-based, converted to pixels. */
+    CHECK(kittyfb_origin_x(&session) == 700);
+    CHECK(kittyfb_origin_y(&session) == 280);
+    /* A graphics placement starts on a cell boundary, so these always
+     * land on one too. */
+    CHECK(kittyfb_origin_x(&session) % kittyfb_cell_width(&session) == 0);
+    CHECK(kittyfb_origin_y(&session) % kittyfb_cell_height(&session) == 0);
+
+    /* A resize moves them, or the offset would be stale for the rest of
+     * the session - the case a caller cannot detect for itself. */
+    (void)memset(&window, 0, sizeof(window));
+    window.ws_col = 100;
+    window.ws_row = 30;
+    window.ws_xpixel = 900;
+    window.ws_ypixel = 540;
+    CHECK(ioctl(master, TIOCSWINSZ, &window) == 0);
+    kittyfb_notify_resize();
+    CHECK(kittyfb_check_resize(&session, &width, &height));
+    CHECK(width == 900 && height == 522);
+    CHECK(kittyfb_origin_x(&session) == 0);
+    CHECK(kittyfb_origin_y(&session) == 0);
+
+    CHECK(kittyfb_origin_x(NULL) == 0);
+    CHECK(kittyfb_origin_y(NULL) == 0);
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
 /* Does the captured escape stream contain this literal? */
 static bool wire_has(const char *buffer, size_t used, const char *needle)
 {
@@ -1803,6 +1864,8 @@ main(void)
          test_pty_probe_disabled_starts_blind},
         {"PTY emergency restore", test_pty_emergency_restore},
         {"PTY resize", test_pty_resize},
+        {"PTY origin is the centering offset",
+         test_pty_origin_is_the_centering_offset},
         {"PTY damage patches in place", test_pty_damage_patches_in_place},
         {"PTY damage falls back", test_pty_damage_falls_back},
         {"PTY damage rect handling", test_pty_damage_rect_handling},

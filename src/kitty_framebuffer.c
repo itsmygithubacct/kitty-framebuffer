@@ -545,6 +545,16 @@ int kittyfb_cell_height(const kittyfb_session *session)
     return session != NULL ? session->cell_height : 0;
 }
 
+int kittyfb_origin_x(const kittyfb_session *session)
+{
+    return session != NULL ? session->origin_x : 0;
+}
+
+int kittyfb_origin_y(const kittyfb_session *session)
+{
+    return session != NULL ? session->origin_y : 0;
+}
+
 bool kittyfb_failed(const kittyfb_session *session)
 {
     bool failed;
@@ -1350,6 +1360,12 @@ static void set_geometry(kittyfb_session *session, const kittyfb_geometry *g)
     session->height = g->height;
     session->cell_width = g->cell_width;
     session->cell_height = g->cell_height;
+    /* The placement is a cursor position, in cells.  Anything that has to
+     * relate terminal pixel coordinates to frame pixel coordinates - a
+     * mouse, most obviously - needs it as pixels, and deriving it from
+     * the escape sequence is not something a caller should be doing. */
+    session->origin_x = (g->origin_column - 1) * g->cell_width;
+    session->origin_y = (g->origin_row - 1) * g->cell_height;
     (void)snprintf(
         session->origin_sequence,
         sizeof(session->origin_sequence),
@@ -1573,12 +1589,7 @@ bool kittyfb_check_resize(kittyfb_session *session, int *width, int *height)
         geometry.cell_height != session->cell_height ||
         strcmp(origin, session->origin_sequence) != 0;
     if (anything_changed) {
-        session->width = geometry.width;
-        session->height = geometry.height;
-        session->cell_width = geometry.cell_width;
-        session->cell_height = geometry.cell_height;
-        memcpy(session->origin_sequence, origin,
-               sizeof(session->origin_sequence));
+        set_geometry(session, &geometry);
         /* The presenter wipes stale cells inside its next synchronized
          * update; clearing here would interleave with an in-flight
          * frame write. */
