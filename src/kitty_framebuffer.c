@@ -40,6 +40,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -48,6 +49,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -55,7 +57,8 @@
  * small zlib streams stop being cheaper than one clean frame; the rect cap
  * bounds the stack array and catches a caller handing over a scatter of
  * damage that is really a full repaint. */
-#define KITTYFB_DAMAGE_MAX_FRACTION 0.35
+#define KITTYFB_DAMAGE_FRACTION_NUMERATOR 7u
+#define KITTYFB_DAMAGE_FRACTION_DENOMINATOR 20u
 #define KITTYFB_DAMAGE_MAX_RECTS 64
 
 /* The probe never places an image (a=q is query-only), so this id cannot
@@ -72,6 +75,23 @@ static const char BASE64_TABLE[] =
 /* One flag for the whole process: a signal handler cannot carry a session
  * pointer, and a session owns the terminal exclusively anyway. */
 static volatile sig_atomic_t winch_flag;
+
+/* Full-frame presentation happens on the presenter thread, while damage
+ * presentation is synchronous on the caller.  Both paths share encoder
+ * scratch and one output stream, so they must claim this serializer before
+ * consuming a pending frame or editing the image already on screen.  Keeping
+ * it private preserves the pre-1.0 public session layout and safely degrades
+ * unusual multi-terminal processes to process-wide encode serialization. */
+static pthread_mutex_t encode_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Dimensions of the last full frame completed under encode_lock.  The public
+ * session has pending-frame dimensions but deliberately has no ABI room for a
+ * second displayed-frame pair.  A single cache is safe for the documented
+ * one-terminal session; a second simultaneous session merely forces damage to
+ * fall back to a full frame when this cache names the other session. */
+static const kittyfb_session *displayed_session;
+static int displayed_width;
+static int displayed_height;
 
 static void handle_winch(int signal_number)
 {
@@ -90,8 +110,9 @@ size_t kittyfb_base64_encode(const uint8_t *input, size_t length, char *output)
 {
     size_t in = 0;
     size_t out = 0;
+    const size_t complete_end = length - length % 3u;
 
-    while (in + 2 < length) {
+    while (in < complete_end) {
         uint32_t value = ((uint32_t)input[in] << 16) |
                          ((uint32_t)input[in + 1] << 8) |
                          (uint32_t)input[in + 2];
@@ -101,13 +122,13 @@ size_t kittyfb_base64_encode(const uint8_t *input, size_t length, char *output)
         output[out++] = BASE64_TABLE[value & 63u];
         in += 3;
     }
-    if (in + 1 == length) {
+    if (length - complete_end == 1u) {
         uint32_t value = (uint32_t)input[in] << 16;
         output[out++] = BASE64_TABLE[(value >> 18) & 63u];
         output[out++] = BASE64_TABLE[(value >> 12) & 63u];
         output[out++] = '=';
         output[out++] = '=';
-    } else if (in + 2 == length) {
+    } else if (length - complete_end == 2u) {
         uint32_t value = ((uint32_t)input[in] << 16) |
                          ((uint32_t)input[in + 1] << 8);
         output[out++] = BASE64_TABLE[(value >> 18) & 63u];
@@ -181,20 +202,18 @@ bool kittyfb_derive_geometry(
     /* leave one cell row free at the bottom so the shell prompt after
      * exit doesn't scroll the image */
     int grid_rows = rows > 1 ? rows - 1 : 1;
-    int width = columns * cell_width;
-    int height = grid_rows * cell_height;
-    if (width < options->min_width) {
-        width = options->min_width;
-    }
-    if (height < options->min_height) {
-        height = options->min_height;
-    }
-    if (width > options->max_width) {
-        width = options->max_width;
-    }
-    if (height > options->max_height) {
-        height = options->max_height;
-    }
+    int64_t available_width = (int64_t)columns * (int64_t)cell_width;
+    int64_t available_height = (int64_t)grid_rows * (int64_t)cell_height;
+    int width = available_width < options->min_width
+                    ? options->min_width
+                    : available_width > options->max_width
+                          ? options->max_width
+                          : (int)available_width;
+    int height = available_height < options->min_height
+                     ? options->min_height
+                     : available_height > options->max_height
+                           ? options->max_height
+                           : (int)available_height;
     /* Snap to whole, even cell groups without crossing back below the
      * requested minimum. A minimum can encode a required integer scale,
      * so rounding below it is more harmful than covering one extra cell. */
@@ -207,8 +226,8 @@ bool kittyfb_derive_geometry(
     }
 
     /* center the image instead of pinning it top-left */
-    int image_columns = (width + cell_width - 1) / cell_width;
-    int image_rows = (height + cell_height - 1) / cell_height;
+    int image_columns = (int)(((int64_t)width + cell_width - 1) / cell_width);
+    int image_rows = (int)(((int64_t)height + cell_height - 1) / cell_height);
     int origin_column = 1 + (columns - image_columns) / 2;
     int origin_row = 1 + (grid_rows - image_rows) / 2;
     if (origin_column < 1) {
@@ -243,7 +262,8 @@ size_t kittyfb_build_packet(
     size_t remaining = capacity;
     int printed;
 
-    if (output == NULL || payload == NULL || origin == NULL ||
+    if (output == NULL || payload == NULL || payload_length == 0u ||
+        origin == NULL ||
         new_id <= 0 || old_id <= 0 || width <= 0 || height <= 0) {
         return 0;
     }
@@ -383,38 +403,73 @@ size_t kittyfb_build_shm_packet(
 
 /* ------------------------------ small utils ----------------------------- */
 
+/* A C object cannot usefully exceed PTRDIFF_MAX bytes even when SIZE_MAX is
+ * larger.  Applying that bound before allocation also keeps hostile int-sized
+ * dimensions out of zlib, mmap/ftruncate and pointer-offset arithmetic. */
+static bool frame_byte_count(int width, int height, size_t *out)
+{
+    if (width <= 0 || height <= 0 || out == NULL ||
+        (size_t)width > (size_t)PTRDIFF_MAX / 4u / (size_t)height) {
+        return false;
+    }
+    *out = (size_t)width * (size_t)height * 4u;
+    return true;
+}
+
 /* Growth always goes through a temporary so a failed realloc keeps the
  * old buffer and the old capacity: with "cap = n; p = realloc(p, cap)" a
  * single OOM left p == NULL while cap claimed the space existed, so every
  * later frame skipped the realloc and bailed - the picture froze forever
  * and the old block leaked. */
-static bool grow_bytes(uint8_t **buffer, size_t *capacity, size_t needed)
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 10
+/* GCC 12's analyzer can merge distinct session scratch fields across
+ * successive realloc calls and report the successful moved result as leaked
+ * on the impossible branch where that same result is NULL.  Keep ordinary
+ * compiler warnings enabled and suppress only that modeled false positive in
+ * these canonical temporary-pointer realloc helpers. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
+#endif
+
+static bool
+grow_bytes(uint8_t **buffer, size_t *capacity, size_t needed)
 {
+    if (needed > (size_t)PTRDIFF_MAX) {
+        return false;
+    }
     if (needed <= *capacity) {
         return true;
     }
     uint8_t *grown = realloc(*buffer, needed);
-    if (grown == NULL) {
-        return false;
+    if (grown != NULL) {
+        *buffer = grown;
+        *capacity = needed;
+        return true;
     }
-    *buffer = grown;
-    *capacity = needed;
-    return true;
+    return false;
 }
 
-static bool grow_chars(char **buffer, size_t *capacity, size_t needed)
+static bool
+grow_chars(char **buffer, size_t *capacity, size_t needed)
 {
+    if (needed > (size_t)PTRDIFF_MAX) {
+        return false;
+    }
     if (needed <= *capacity) {
         return true;
     }
     char *grown = realloc(*buffer, needed);
-    if (grown == NULL) {
-        return false;
+    if (grown != NULL) {
+        *buffer = grown;
+        *capacity = needed;
+        return true;
     }
-    *buffer = grown;
-    *capacity = needed;
-    return true;
+    return false;
 }
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 10
+#pragma GCC diagnostic pop
+#endif
 
 /* Cancellable, poll-based write loop for the non-blocking output fd.
  * Returns false when fenced, cancelled, stalled out, or on error. */
@@ -443,10 +498,12 @@ static bool write_all(kittyfb_session *session, const char *data, size_t size)
                 return false;
             }
             struct pollfd descriptor = { session->output_fd, POLLOUT, 0 };
-            int ready;
-            do {
-                ready = poll(&descriptor, 1u, 50);
-            } while (ready < 0 && errno == EINTR);
+            int ready = poll(&descriptor, 1u, 50);
+            if (ready < 0 && errno == EINTR) {
+                /* Return to the outer loop so cancellation/fencing and the
+                 * bounded stall counter are observed under signal traffic. */
+                continue;
+            }
             if (ready < 0) {
                 return false;
             }
@@ -467,12 +524,58 @@ static bool write_all(kittyfb_session *session, const char *data, size_t size)
 
 static bool read_byte_timeout(int fd, unsigned char *byte, int timeout_ms)
 {
+    struct timespec deadline;
+    bool polled_once = false;
+
+    if (byte == NULL || timeout_ms < 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        return false;
+    }
+    deadline.tv_sec += (time_t)(timeout_ms / 1000);
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
     /* Retry across signal interruptions (SIGWINCH arrives continuously
      * while a window is dragged); an EINTR misread as a timeout would
-     * truncate the probe response mid-parse. */
+     * truncate the probe response mid-parse.  Keep one monotonic deadline,
+     * though, so signal traffic cannot restart the timeout indefinitely. */
     for (;;) {
+        struct timespec now;
         struct pollfd descriptor = { fd, POLLIN, 0 };
-        int ready = poll(&descriptor, 1u, timeout_ms);
+        time_t seconds;
+        long nanoseconds;
+        int remaining;
+        int ready;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            return false;
+        }
+        seconds = deadline.tv_sec - now.tv_sec;
+        nanoseconds = deadline.tv_nsec - now.tv_nsec;
+        if (nanoseconds < 0) {
+            seconds--;
+            nanoseconds += 1000000000L;
+        }
+        if (seconds < 0 || (seconds == 0 && nanoseconds <= 0)) {
+            if (polled_once) {
+                errno = ETIMEDOUT;
+                return false;
+            }
+            remaining = 0;
+        } else if (seconds >= (time_t)(INT_MAX / 1000)) {
+            remaining = INT_MAX;
+        } else {
+            int64_t milliseconds = (int64_t)seconds * 1000 +
+                ((int64_t)nanoseconds + 999999) / 1000000;
+            remaining = milliseconds > INT_MAX
+                ? INT_MAX
+                : (int)milliseconds;
+        }
+        polled_once = true;
+        ready = poll(&descriptor, 1u, remaining);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -480,9 +583,24 @@ static bool read_byte_timeout(int fd, unsigned char *byte, int timeout_ms)
             return false;
         }
         if (ready == 0) {
+            errno = ETIMEDOUT;
             return false;
         }
-        return read(fd, byte, 1u) == 1;
+        if ((descriptor.revents & POLLIN) == 0) {
+            errno = (descriptor.revents & POLLNVAL) != 0 ? EBADF : EIO;
+            return false;
+        }
+        ssize_t count = read(fd, byte, 1u);
+        if (count == 1) {
+            return true;
+        }
+        if (count == 0) {
+            errno = EIO;
+            return false;
+        }
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return false;
+        }
     }
 }
 
@@ -627,11 +745,11 @@ static int shm_ring_reap(kittyfb_session *session)
 }
 
 /*
- * Copy `size` bytes into a free slot and return its name, or NULL when
+ * Copy `size` bytes into a free slot and return the slot, or NULL when
  * every slot is still in flight (the caller drops the frame) or the
  * object could not be created.  *saturated distinguishes the two.
  */
-static const char *shm_ring_publish(
+static struct kittyfb_shm_slot *shm_ring_publish(
     kittyfb_session *session,
     const uint8_t *data,
     size_t size,
@@ -682,7 +800,16 @@ static const char *shm_ring_publish(
     slot->mapping = mapping;
     slot->mapping_size = size;
     slot->busy = true;
-    return slot->name;
+    return slot;
+}
+
+/* Roll back a slot whose packet never completed.  Leaving its still-present
+ * name marked busy would permanently shrink the ring because no terminal was
+ * given a complete request that could unlink it. */
+static void shm_slot_discard(struct kittyfb_shm_slot *slot)
+{
+    (void)shm_unlink(slot->name);
+    shm_slot_release(slot);
 }
 
 static void shm_ring_destroy(kittyfb_session *session)
@@ -711,7 +838,8 @@ static void shm_ring_destroy(kittyfb_session *session)
  */
 static bool shm_ring_create(kittyfb_session *session, int slot_count)
 {
-    unsigned serial = shm_session_serial++;
+    unsigned serial = __atomic_fetch_add(
+        &shm_session_serial, 1u, __ATOMIC_RELAXED);
     struct kittyfb_shm_slot *slots =
         calloc((size_t)slot_count, sizeof(*slots));
 
@@ -831,12 +959,22 @@ static bool publish_shm(
     bool clear_first,
     bool *dropped)
 {
-    size_t size = (size_t)width * (size_t)height * 4u;
+    size_t size;
     bool saturated = false;
-    const char *name = shm_ring_publish(session, rgba, size, &saturated);
+    struct kittyfb_shm_slot *slot;
 
-    if (name == NULL) {
+    if (!frame_byte_count(width, height, &size)) {
+        return false;
+    }
+    slot = shm_ring_publish(session, rgba, size, &saturated);
+
+    if (slot == NULL) {
         *dropped = saturated;
+        return false;
+    }
+    if (__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE)) {
+        shm_slot_discard(slot);
         return false;
     }
 
@@ -847,12 +985,13 @@ static bool publish_shm(
     size_t packet_needed = KITTYFB_SHM_NAME_MAX * 2u + 512u;
     if (!grow_chars(&session->packet_buffer, &session->packet_capacity,
                     packet_needed)) {
+        shm_slot_discard(slot);
         return false;
     }
     size_t packet_length = kittyfb_build_shm_packet(
         session->packet_buffer,
         session->packet_capacity,
-        name,
+        slot->name,
         new_id,
         session->shown_image_id,
         width,
@@ -860,17 +999,55 @@ static bool publish_shm(
         origin,
         clear_first);
     if (packet_length == 0) {
+        shm_slot_discard(slot);
         return false;
     }
 
     if (__atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE)) {
+        shm_slot_discard(slot);
         return false;
     }
     if (!write_all(session, session->packet_buffer, packet_length)) {
+        shm_slot_discard(slot);
         return false;
     }
     session->shown_image_id = new_id;
     return true;
+}
+
+/* Source and destination are distinct session/caller buffers.  Expressing
+ * that contract lets optimizing compilers vectorize the 4-byte to 3-byte
+ * shuffle instead of guarding a hot full-frame loop for hypothetical alias. */
+static void pack_rgb(
+    const uint8_t *restrict rgba,
+    uint8_t *restrict rgb,
+    size_t pixels)
+{
+    while (pixels >= 4u) {
+        rgb[0] = rgba[0];
+        rgb[1] = rgba[1];
+        rgb[2] = rgba[2];
+        rgb[3] = rgba[4];
+        rgb[4] = rgba[5];
+        rgb[5] = rgba[6];
+        rgb[6] = rgba[8];
+        rgb[7] = rgba[9];
+        rgb[8] = rgba[10];
+        rgb[9] = rgba[12];
+        rgb[10] = rgba[13];
+        rgb[11] = rgba[14];
+        rgba += 16;
+        rgb += 12;
+        pixels -= 4u;
+    }
+    while (pixels != 0u) {
+        rgb[0] = rgba[0];
+        rgb[1] = rgba[1];
+        rgb[2] = rgba[2];
+        rgba += 4;
+        rgb += 3;
+        --pixels;
+    }
 }
 
 static bool encode_and_write(
@@ -882,16 +1059,16 @@ static bool encode_and_write(
     bool clear_first,
     bool *dropped)
 {
+    size_t rgba_length;
+
     *dropped = false;
 
     /* A signal-time restore has fenced the presenter: emit nothing. */
-    if (__atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE)) {
         return false;
     }
-    if (rgba == NULL || width <= 0 || height <= 0) {
-        return false;
-    }
-    if ((size_t)width > SIZE_MAX / 4u / (size_t)height) {
+    if (rgba == NULL || !frame_byte_count(width, height, &rgba_length)) {
         return false;
     }
 
@@ -902,19 +1079,15 @@ static bool encode_and_write(
 
     /* strip the (ignored) alpha channel: 25% less data to compress,
      * encode and push down the terminal connection every frame */
-    size_t pixels = (size_t)width * (size_t)height;
+    size_t pixels = rgba_length / 4u;
     size_t raw_length = pixels * 3u;
     if (!grow_bytes(&session->rgb_buffer, &session->rgb_capacity, raw_length)) {
         return false;
     }
-    const uint8_t *source = rgba;
-    uint8_t *destination = session->rgb_buffer;
-    for (size_t index = 0; index < pixels; index++) {
-        destination[0] = source[0];
-        destination[1] = source[1];
-        destination[2] = source[2];
-        source += 4;
-        destination += 3;
+    pack_rgb(rgba, session->rgb_buffer, pixels);
+    if (__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE)) {
+        return false;
     }
 
     size_t z_needed = (size_t)compressBound((uLong)raw_length);
@@ -1003,6 +1176,24 @@ static void *presenter_main(void *opaque)
             pthread_mutex_unlock(&session->frame_lock);
             break;
         }
+        pthread_mutex_unlock(&session->frame_lock);
+
+        /* Claim the shared encoder/output before consuming the pending slot.
+         * A damage call that wins this race can see frame_pending and safely
+         * replace it with a complete newest frame instead of patching the
+         * older image underneath an in-flight transmission. */
+        pthread_mutex_lock(&encode_lock);
+        pthread_mutex_lock(&session->frame_lock);
+        if (!session->presenter_running) {
+            pthread_mutex_unlock(&session->frame_lock);
+            pthread_mutex_unlock(&encode_lock);
+            break;
+        }
+        if (!session->frame_pending) {
+            pthread_mutex_unlock(&session->frame_lock);
+            pthread_mutex_unlock(&encode_lock);
+            continue;
+        }
         /* Swap buffers together with their capacities: the caller keeps
          * writing new frames into pending_buffer while this one encodes
          * from encode_buffer.  The caller only ever grows the pending
@@ -1036,12 +1227,25 @@ static void *presenter_main(void *opaque)
         pthread_mutex_lock(&session->frame_lock);
         if (encoded) {
             session->stats.frames_encoded++;
-        } else if (dropped) {
+            displayed_session = session;
+            displayed_width = width;
+            displayed_height = height;
+        } else {
+            /* A clear belongs to the next frame that actually reaches the
+             * screen.  Keep it pending across a saturated SHM ring or an
+             * encode/write failure instead of silently consuming it. */
+            if (clear_first) {
+                session->clear_pending = true;
+            }
+        }
+        if (!encoded && dropped) {
             /* Every shared-memory slot is still unread.  Dropping the
              * newest frame is the same bargain the pending slot already
              * makes: a slow terminal costs frames, never a stall. */
             session->stats.frames_dropped++;
-        } else if (!__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) &&
+        } else if (!encoded &&
+                   !__atomic_load_n(&session->write_cancel,
+                                   __ATOMIC_ACQUIRE) &&
                    !__atomic_load_n(&session->presenter_disabled,
                                     __ATOMIC_ACQUIRE)) {
             /* A cancelled or fenced write is shutdown noise, not a
@@ -1052,6 +1256,7 @@ static void *presenter_main(void *opaque)
         }
         bool keep_running = session->presenter_running;
         pthread_mutex_unlock(&session->frame_lock);
+        pthread_mutex_unlock(&encode_lock);
         if (!keep_running) {
             break;
         }
@@ -1065,14 +1270,12 @@ bool kittyfb_present(
     int width,
     int height)
 {
+    size_t needed;
+
     if (session == NULL || !session->active || rgba == NULL ||
-        width <= 0 || height <= 0) {
+        !frame_byte_count(width, height, &needed)) {
         return false;
     }
-    if ((size_t)width > SIZE_MAX / 4u / (size_t)height) {
-        return false;
-    }
-    size_t needed = (size_t)width * (size_t)height * 4u;
 
     pthread_mutex_lock(&session->frame_lock);
     if (session->presenter_failed ||
@@ -1101,18 +1304,29 @@ bool kittyfb_present(
             session->clear_pending = false;
             session->stats.frames_presented++;
             pthread_mutex_unlock(&session->frame_lock);
+            pthread_mutex_lock(&encode_lock);
             bool dropped = false;
             bool encoded = encode_and_write(
                 session, rgba, width, height, origin, clear_first, &dropped);
             pthread_mutex_lock(&session->frame_lock);
             if (encoded) {
                 session->stats.frames_encoded++;
-            } else if (dropped) {
-                session->stats.frames_dropped++;
+                displayed_session = session;
+                displayed_width = width;
+                displayed_height = height;
             } else {
+                if (clear_first) {
+                    session->clear_pending = true;
+                }
+            }
+            if (!encoded && dropped) {
+                session->stats.frames_dropped++;
+            } else if (!encoded) {
                 session->stats.encode_failures++;
+                session->presenter_failed = true;
             }
             pthread_mutex_unlock(&session->frame_lock);
+            pthread_mutex_unlock(&encode_lock);
             /* A dropped frame is not a presentation failure: the caller
              * should keep sending frames, exactly as it does when the
              * pending slot is overwritten. */
@@ -1173,11 +1387,12 @@ static void presenter_shutdown(
         session->z_capacity = 0;
         session->b64_capacity = 0;
         session->packet_capacity = 0;
-        /* The presenter is joined, so nothing else can touch the ring.
-         * Suspension deliberately keeps it, matching the frame buffers:
-         * a resumed session reuses its slot names. */
-        shm_ring_destroy(session);
     }
+    /* A suspended process may remain stopped indefinitely; do not pin unread
+     * multi-megabyte tmpfs mappings during that time.  Heap encoder buffers
+     * retain the expensive high-water allocations, while start cheaply
+     * resolves a fresh ring and honors any changed transport options. */
+    shm_ring_destroy(session);
     pthread_mutex_unlock(&session->frame_lock);
     __atomic_store_n(&session->write_cancel, 0, __ATOMIC_RELEASE);
 }
@@ -1188,13 +1403,20 @@ static void presenter_shutdown(
  * query image followed by a primary device-attributes request.  Graphics
  * terminals answer the APC query; every terminal answers the DA1, which
  * bounds the wait on terminals that silently ignore APCs. */
-static bool probe_for_graphics(kittyfb_session *session)
+typedef enum probe_result {
+    PROBE_ERROR = -1,
+    PROBE_UNSUPPORTED = 0,
+    PROBE_SUPPORTED = 1
+} probe_result;
+
+static probe_result probe_for_graphics(kittyfb_session *session)
 {
     char query[80];
     char expected[24];
     char response[512];
     size_t length = 0;
     bool graphics = false;
+    bool da_complete = false;
 
     int printed = snprintf(
         query,
@@ -1202,10 +1424,11 @@ static bool probe_for_graphics(kittyfb_session *session)
         "\x1b_Gi=%d,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\\x1b[c",
         KITTYFB_PROBE_IMAGE_ID);
     if (printed < 0 || (size_t)printed >= sizeof(query)) {
-        return false;
+        errno = EOVERFLOW;
+        return PROBE_ERROR;
     }
     if (!write_all(session, query, (size_t)printed)) {
-        return false;
+        return PROBE_ERROR;
     }
     printed = snprintf(
         expected,
@@ -1213,7 +1436,8 @@ static bool probe_for_graphics(kittyfb_session *session)
         "\x1b_Gi=%d",
         KITTYFB_PROBE_IMAGE_ID);
     if (printed < 0 || (size_t)printed >= sizeof(expected)) {
-        return false;
+        errno = EOVERFLOW;
+        return PROBE_ERROR;
     }
 
     while (length + 1 < sizeof(response)) {
@@ -1232,14 +1456,25 @@ static bool probe_for_graphics(kittyfb_session *session)
         }
         /* primary DA reply terminator */
         if (byte == 'c' && strstr(response, "\x1b[?") != NULL) {
+            da_complete = true;
             break;
         }
     }
-    return graphics;
+    if (graphics) {
+        return PROBE_SUPPORTED;
+    }
+    if (da_complete || errno == ETIMEDOUT) {
+        return PROBE_UNSUPPORTED;
+    }
+    if (length + 1u >= sizeof(response)) {
+        errno = EOVERFLOW;
+    }
+    return PROBE_ERROR;
 }
 
 static bool validate_options(const kittyfb_options *options)
 {
+    size_t maximum_frame_bytes;
     bool enter_valid = options->enter_sequence == NULL ||
         memchr(options->enter_sequence, '\0',
                KITTYFB_CONTROL_SEQUENCE_MAX + 1u) != NULL;
@@ -1257,7 +1492,9 @@ static bool validate_options(const kittyfb_options *options)
            options->transport <= KITTYFB_TRANSPORT_SHM &&
            options->shm_slots >= 1 &&
            options->shm_slots <= KITTYFB_SHM_SLOTS_MAX &&
-           enter_valid && leave_valid;
+           enter_valid && leave_valid &&
+           frame_byte_count(options->max_width, options->max_height,
+                            &maximum_frame_bytes);
 }
 
 /*
@@ -1376,7 +1613,7 @@ int kittyfb_start(
         errno = EINVAL;
         return -1;
     }
-    if (session->active) {
+    if (session->active || session->presenter_started) {
         errno = EBUSY;
         return -1;
     }
@@ -1429,30 +1666,31 @@ int kittyfb_start(
     session->frame_pending = false;
     session->clear_pending = false;
     session->shown_image_id = session->options.image_id_b;
+    session->termios_saved = false;
+    session->winch_handler_installed = false;
+    session->output_flags_saved = false;
     (void)memset(&session->stats, 0, sizeof(session->stats));
     winch_flag = 0;
 
-    /* A suspended session keeps its ring; a fresh one builds a new one
-     * under a new serial so two sessions never share slot names. */
-    if (session->shm_slots == NULL) {
-        resolve_transport(session);
-    }
+    /* Rings are cheap metadata around potentially large in-flight mappings.
+     * Re-resolve on every start so suspend does not pin tmpfs and changed
+     * transport options or environment are honored on resume. */
+    shm_ring_destroy(session);
+    resolve_transport(session);
 
     /* Non-blocking output: neither the presenter nor the async-signal
      * restore may ever hang on a stalled terminal connection. */
     int flags = fcntl(output_fd, F_GETFL);
     if (flags < 0) {
-        return -1;
+        goto fail;
     }
     session->saved_output_flags = flags;
     session->output_flags_saved = true;
     if ((flags & O_NONBLOCK) == 0 &&
         fcntl(output_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-        session->output_flags_saved = false;
-        return -1;
+        goto fail;
     }
 
-    session->termios_saved = false;
     if (session->options.manage_raw_mode) {
         if (tcgetattr(input_fd, &session->saved_termios) != 0) {
             goto fail;
@@ -1472,10 +1710,15 @@ int kittyfb_start(
     }
 
     if (session->options.probe_graphics &&
-        getenv("KITTYFB_SKIP_PROBE") == NULL &&
-        !probe_for_graphics(session)) {
-        errno = ENOTSUP;
-        goto fail;
+        getenv("KITTYFB_SKIP_PROBE") == NULL) {
+        probe_result probe = probe_for_graphics(session);
+
+        if (probe != PROBE_SUPPORTED) {
+            if (probe == PROBE_UNSUPPORTED) {
+                errno = ENOTSUP;
+            }
+            goto fail;
+        }
     }
 
     session->winch_handler_installed = false;
@@ -1529,6 +1772,7 @@ fail:
         (void)fcntl(output_fd, F_SETFL, session->saved_output_flags);
         session->output_flags_saved = false;
     }
+    shm_ring_destroy(session);
     errno = failure;
     return -1;
 }
@@ -1638,14 +1882,31 @@ void kittyfb_stop(kittyfb_session *session)
     if (session == NULL) {
         return;
     }
-    restore = session->active || session->presenter_started;
-    retained =
-        session->pending_buffer != NULL ||
-        session->encode_buffer != NULL ||
-        session->rgb_buffer != NULL ||
-        session->z_buffer != NULL ||
-        session->b64_buffer != NULL ||
-        session->packet_buffer != NULL;
+    /* The signal-safe emergency path restores the OS state but deliberately
+     * leaves ordinary bookkeeping intact.  Even when no frame was ever
+     * presented (and therefore no presenter or retained buffer exists), a
+     * later stop must clear that bookkeeping, restore SIGWINCH, and reapply
+     * descriptor/termios state after any outer lifecycle layer unwinds. */
+    restore = session->active || session->presenter_started ||
+        session->termios_saved || session->output_flags_saved ||
+        session->winch_handler_installed;
+    retained = false;
+    if (!restore) {
+        /* The presenter swaps these pointers while holding frame_lock.  They
+         * need not be sampled at all for an active session, and a suspended
+         * session is inspected under the same lock before deciding whether
+         * final cleanup is needed. */
+        pthread_mutex_lock(&session->frame_lock);
+        retained =
+            session->pending_buffer != NULL ||
+            session->encode_buffer != NULL ||
+            session->rgb_buffer != NULL ||
+            session->z_buffer != NULL ||
+            session->b64_buffer != NULL ||
+            session->packet_buffer != NULL ||
+            session->shm_slots != NULL;
+        pthread_mutex_unlock(&session->frame_lock);
+    }
     if (!restore && !retained) return;
     /* Stop the presenter first so no frame write interleaves with the
      * restore sequence.  This also reclaims the thread and buffers after
@@ -1749,6 +2010,39 @@ static bool damage_rect_valid(const kittyfb_rect *rect, int width, int height,
     return true;
 }
 
+static size_t damage_rect_area(const kittyfb_rect *rect)
+{
+    return (size_t)(rect->x1 - rect->x0) *
+           (size_t)(rect->y1 - rect->y0);
+}
+
+/* Merge overlap/adjacency only when the bounding rectangle sends no more
+ * pixels than the two streams it replaces.  The complete frame is available,
+ * so including the unchanged pixels between partially overlapping rects is
+ * correct, but it is not automatically cheaper. */
+static bool merge_damage_rects(
+    const kittyfb_rect *a,
+    const kittyfb_rect *b,
+    kittyfb_rect *merged)
+{
+    kittyfb_rect out;
+
+    if (a->x1 < b->x0 || b->x1 < a->x0 ||
+        a->y1 < b->y0 || b->y1 < a->y0) {
+        return false;
+    }
+    out.x0 = a->x0 < b->x0 ? a->x0 : b->x0;
+    out.y0 = a->y0 < b->y0 ? a->y0 : b->y0;
+    out.x1 = a->x1 > b->x1 ? a->x1 : b->x1;
+    out.y1 = a->y1 > b->y1 ? a->y1 : b->y1;
+    if (damage_rect_area(&out) >
+        damage_rect_area(a) + damage_rect_area(b)) {
+        return false;
+    }
+    *merged = out;
+    return true;
+}
+
 /* One a=f packet for one rectangle: RGB, zlib, base64, chunked. */
 static bool write_damage_rect(
     kittyfb_session *session,
@@ -1778,13 +2072,8 @@ static bool write_damage_rect(
         for (int y = rect->y0; y < rect->y1; y++) {
             const uint8_t *row = rgba + ((size_t)y * (size_t)width +
                                          (size_t)rect->x0) * 4u;
-
-            for (int x = 0; x < rect_width; x++) {
-                *out++ = row[0];
-                *out++ = row[1];
-                *out++ = row[2];
-                row += 4;
-            }
+            pack_rgb(row, out, (size_t)rect_width);
+            out += (size_t)rect_width * 3u;
         }
     }
 
@@ -1798,7 +2087,14 @@ static bool write_damage_rect(
         return false;
     }
 
-    needed = ((size_t)z_length + 2u) / 3u * 4u + 1u;
+    if ((size_t)z_length > SIZE_MAX - 2u) {
+        return false;
+    }
+    needed = ((size_t)z_length + 2u) / 3u;
+    if (needed > (SIZE_MAX - 1u) / 4u) {
+        return false;
+    }
+    needed = needed * 4u + 1u;
     if (!grow_chars(&session->b64_buffer, &session->b64_capacity,
                     needed)) {
         return false;
@@ -1806,14 +2102,31 @@ static bool write_damage_rect(
     encoded_length = kittyfb_base64_encode(
         session->z_buffer, (size_t)z_length, session->b64_buffer);
 
-    /* r=1 edits the root frame; x/y place the patch inside the existing
-     * image; s/v are the patch's own dimensions. */
+    /* Build a rect into one contiguous write rather than issuing three
+     * syscalls per 4 KiB chunk.  The protocol requires every continuation
+     * of animation frame data to repeat both a=f and the image id. */
     {
+        size_t chunk_count =
+            (encoded_length - 1u) / KITTYFB_CHUNK_SIZE + 1u;
+        size_t packet_needed;
+        char *at;
+        size_t remaining;
         size_t offset = 0u;
         bool first = true;
 
+        if (chunk_count == 0u ||
+            chunk_count > (SIZE_MAX - encoded_length) / 194u) {
+            return false;
+        }
+        packet_needed = encoded_length + chunk_count * 194u;
+        if (!grow_chars(&session->packet_buffer, &session->packet_capacity,
+                        packet_needed)) {
+            return false;
+        }
+        at = session->packet_buffer;
+        remaining = session->packet_capacity;
+
         while (offset < encoded_length) {
-            char header[192];
             size_t count = encoded_length - offset;
             int more;
             int printed;
@@ -1824,28 +2137,38 @@ static bool write_damage_rect(
             more = offset + count < encoded_length ? 1 : 0;
             if (first) {
                 printed = snprintf(
-                    header, sizeof(header),
-                    "\x1b_Ga=f,i=%d,r=1,q=2,f=24,o=z,x=%d,y=%d,s=%d,v=%d,m=%d;",
+                    at, remaining,
+                    "\x1b_Ga=f,i=%d,r=1,X=1,q=2,f=24,o=z,x=%d,y=%d,s=%d,v=%d,m=%d;",
                     image_id, rect->x0, rect->y0, rect_width, rect_height,
                     more);
                 first = false;
             } else {
-                printed = snprintf(header, sizeof(header), "\x1b_Gm=%d;", more);
+                printed = snprintf(
+                    at, remaining, "\x1b_Ga=f,i=%d,q=2,m=%d;",
+                    image_id, more);
             }
-            if (printed < 0 || (size_t)printed >= sizeof(header)) {
+            if (printed < 0 || (size_t)printed >= remaining) {
                 return false;
             }
-            ok = write_all(session, header, (size_t)printed) &&
-                 write_all(session, session->b64_buffer + offset, count) &&
-                 write_all(session, "\x1b\\", 2u);
-            if (!ok) {
+            at += printed;
+            remaining -= (size_t)printed;
+            if (count > remaining || remaining - count < 2u) {
                 return false;
             }
-            *bytes_written += (size_t)printed + count + 2u;
+            memcpy(at, session->b64_buffer + offset, count);
+            at += count;
+            *at++ = '\x1b';
+            *at++ = '\\';
+            remaining -= count + 2u;
             offset += count;
         }
+        size_t packet_length = (size_t)(at - session->packet_buffer);
+        ok = write_all(session, session->packet_buffer, packet_length);
+        if (ok) {
+            *bytes_written += packet_length;
+        }
     }
-    return true;
+    return ok;
 }
 
 bool kittyfb_present_damage(
@@ -1859,47 +2182,88 @@ bool kittyfb_present_damage(
     kittyfb_rect clamped[KITTYFB_DAMAGE_MAX_RECTS];
     size_t usable = 0u;
     size_t damaged_pixels = 0u;
+    size_t rgba_length;
     size_t total_pixels;
+    size_t damage_limit;
     int image_id;
     bool nothing_on_screen;
+    bool fallback;
+    bool too_many_rects;
     size_t bytes = 0u;
     bool ok = true;
 
     if (session == NULL || !session->active || rgba == NULL ||
-        width <= 0 || height <= 0) {
+        !frame_byte_count(width, height, &rgba_length)) {
         return false;
     }
-    if (rects == NULL || rect_count == 0u) {
+    if (rect_count == 0u) {
         return true;   /* nothing changed; not an error */
     }
-    total_pixels = (size_t)width * (size_t)height;
+    if (rects == NULL) {
+        return false;
+    }
+    total_pixels = rgba_length / 4u;
+    damage_limit =
+        (total_pixels / KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
+            KITTYFB_DAMAGE_FRACTION_NUMERATOR +
+        ((total_pixels % KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
+         KITTYFB_DAMAGE_FRACTION_NUMERATOR) /
+            KITTYFB_DAMAGE_FRACTION_DENOMINATOR;
+    too_many_rects = rect_count > KITTYFB_DAMAGE_MAX_RECTS;
 
-    for (size_t i = 0u; i < rect_count && usable < KITTYFB_DAMAGE_MAX_RECTS;
-         i++) {
+    for (size_t i = 0u; i < rect_count && !too_many_rects; i++) {
         kittyfb_rect fixed;
 
         if (!damage_rect_valid(&rects[i], width, height, &fixed)) {
             continue;
         }
-        damaged_pixels += (size_t)(fixed.x1 - fixed.x0) *
-                          (size_t)(fixed.y1 - fixed.y0);
+        for (;;) {
+            bool merged = false;
+
+            for (size_t prior = 0u; prior < usable; ++prior) {
+                kittyfb_rect combined;
+
+                if (merge_damage_rects(
+                        &fixed, &clamped[prior], &combined)) {
+                    fixed = combined;
+                    clamped[prior] = clamped[--usable];
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) {
+                break;
+            }
+        }
         clamped[usable++] = fixed;
     }
-    if (usable == 0u) {
+    for (size_t i = 0u; i < usable; ++i) {
+        size_t area = damage_rect_area(&clamped[i]);
+
+        /* The merge pass removes cost-free overlap/adjacency.  Rectangles
+         * whose bounding box would add too many unchanged pixels can still
+         * overlap, so count them conservatively and saturate at a full frame
+         * rather than wrapping into the patch-fast path. */
+        damaged_pixels = area >= total_pixels - damaged_pixels
+                             ? total_pixels
+                             : damaged_pixels + area;
+    }
+    if (usable == 0u && !too_many_rects) {
         return true;
     }
 
+    pthread_mutex_lock(&encode_lock);
     pthread_mutex_lock(&session->frame_lock);
-    if (session->presenter_failed ||
+    if (!session->active || session->presenter_failed ||
         (session->presenter_started && !session->presenter_running)) {
         pthread_mutex_unlock(&session->frame_lock);
+        pthread_mutex_unlock(&encode_lock);
         return false;
     }
     image_id = session->shown_image_id;
     /* shown_image_id is pre-seeded at start, so it cannot distinguish
      * "nothing presented yet" - only a completed encode can. */
     nothing_on_screen = session->stats.frames_encoded == 0u;
-    pthread_mutex_unlock(&session->frame_lock);
 
     /*
      * Fall back when patching cannot help or cannot work:
@@ -1913,22 +2277,23 @@ bool kittyfb_present_damage(
      * Falling back rather than refusing is what lets a caller use this
      * unconditionally instead of reasoning about when it pays.
      */
-    if (nothing_on_screen || image_id == 0 ||
-        kittyfb_active_transport(session) == KITTYFB_TRANSPORT_SHM ||
-        (double)damaged_pixels >
-            (double)total_pixels * KITTYFB_DAMAGE_MAX_FRACTION ||
-        usable >= KITTYFB_DAMAGE_MAX_RECTS) {
-        pthread_mutex_lock(&session->frame_lock);
+    fallback = nothing_on_screen || image_id == 0 ||
+               session->frame_pending || session->clear_pending ||
+               displayed_session != session || displayed_width != width ||
+               displayed_height != height || session->shm_active ||
+               damaged_pixels > damage_limit || too_many_rects ||
+               usable >= KITTYFB_DAMAGE_MAX_RECTS;
+    if (fallback) {
         session->stats.damage_fallbacks++;
         pthread_mutex_unlock(&session->frame_lock);
+        pthread_mutex_unlock(&encode_lock);
         return kittyfb_present(session, rgba, width, height);
     }
+    pthread_mutex_unlock(&session->frame_lock);
 
     /* One synchronized update around every patch, so the screen never
      * shows a half-applied edit. */
-    if (!write_all(session, "\x1b[?2026h", 8u)) {
-        return false;
-    }
+    ok = write_all(session, "\x1b[?2026h", 8u);
     for (size_t i = 0u; i < usable && ok; i++) {
         ok = write_damage_rect(session, rgba, width, &clamped[i], image_id,
                                &bytes);
@@ -1940,10 +2305,18 @@ bool kittyfb_present_damage(
     pthread_mutex_lock(&session->frame_lock);
     if (ok) {
         session->stats.damage_presents++;
-        session->stats.damage_bytes += bytes;
-    } else {
+        /* Include the DEC synchronized-update begin/end around the graphics
+         * packets: this counter describes all bytes emitted by the patch. */
+        session->stats.damage_bytes += bytes + 16u;
+    } else if (!__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&session->presenter_disabled,
+                                __ATOMIC_ACQUIRE)) {
         session->stats.encode_failures++;
+        session->presenter_failed = true;
+        session->presenter_running = false;
+        pthread_cond_broadcast(&session->frame_cond);
     }
     pthread_mutex_unlock(&session->frame_lock);
+    pthread_mutex_unlock(&encode_lock);
     return ok;
 }
