@@ -21,8 +21,9 @@ STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 SHARED_LIB := $(BUILD_DIR)/lib$(PROJECT).so
 TEST_BIN := $(BUILD_DIR)/test-framebuffer
 EXAMPLE_BIN := $(BUILD_DIR)/bounce
+BENCH_BIN := $(BUILD_DIR)/bench-framebuffer
 
-.PHONY: all clean install sanitize race test
+.PHONY: all benchmark clean install race sanitize test
 
 all: $(STATIC_LIB) $(SHARED_LIB) $(EXAMPLE_BIN)
 
@@ -44,8 +45,15 @@ $(TEST_BIN): tests/test_framebuffer.c $(STATIC_LIB) | $(BUILD_DIR)
 $(EXAMPLE_BIN): examples/bounce.c $(STATIC_LIB) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(STATIC_LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
+$(BENCH_BIN): benchmarks/bench_framebuffer.c $(STATIC_LIB) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $< $(STATIC_LIB) $(LDFLAGS) \
+		$(LDLIBS) -lutil -o $@
+
 test: $(TEST_BIN)
 	$(TEST_BIN)
+
+benchmark: $(BENCH_BIN)
+	$(BENCH_BIN)
 
 sanitize: | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) -Isrc -std=c11 -O1 -g3 -pthread $(WARNINGS) \

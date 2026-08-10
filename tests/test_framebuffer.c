@@ -209,6 +209,34 @@ drain_descriptor(int fd)
     (void)read_available(fd, scratch, sizeof(scratch));
 }
 
+typedef struct wire_drainer {
+    int fd;
+    int stop;
+    uint64_t bytes;
+} wire_drainer;
+
+static void *
+wire_drainer_main(void *opaque)
+{
+    wire_drainer *drainer = opaque;
+    char scratch[16384];
+
+    while (!__atomic_load_n(&drainer->stop, __ATOMIC_ACQUIRE)) {
+        struct pollfd descriptor = {drainer->fd, POLLIN, 0};
+        int ready = poll(&descriptor, 1u, 20);
+
+        if (ready > 0 && (descriptor.revents & POLLIN) != 0) {
+            const ssize_t count = read(drainer->fd, scratch, sizeof(scratch));
+            if (count > 0) {
+                drainer->bytes += (uint64_t)count;
+            }
+        } else if (ready < 0 && errno != EINTR) {
+            break;
+        }
+    }
+    return NULL;
+}
+
 static int
 base64_value(char c)
 {
@@ -325,6 +353,22 @@ fill_test_frame(uint8_t *rgba, int width, int height, uint8_t salt)
     }
 }
 
+static void
+fill_noise_frame(uint8_t *rgba, int width, int height, uint32_t seed)
+{
+    size_t pixels = (size_t)width * (size_t)height;
+
+    for (size_t index = 0u; index < pixels; ++index) {
+        for (size_t channel = 0u; channel < 3u; ++channel) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            rgba[index * 4u + channel] = (uint8_t)seed;
+        }
+        rgba[index * 4u + 3u] = 255u;
+    }
+}
+
 /* ------------------------------ pure tests ------------------------------ */
 
 static bool
@@ -391,6 +435,15 @@ test_geometry_derivation(void)
     /* Zero cells fall back to an 80x24 grid. */
     CHECK(kittyfb_derive_geometry(0, 0, 0, 0, &options, &geometry));
     CHECK(geometry.width == 720 && geometry.height == 414);
+
+    /* The pure helper accepts int inputs, not only unsigned-short ioctl
+     * fields.  Extreme synthetic geometry must clamp without signed
+     * multiplication or ceil-division overflow. */
+    CHECK(kittyfb_derive_geometry(INT_MAX, INT_MAX, 0, 0,
+                                  &options, &geometry));
+    CHECK(geometry.width == 1584);
+    CHECK(geometry.height == 990);
+    CHECK(geometry.origin_row > 0 && geometry.origin_column > 0);
 
     CHECK(!kittyfb_derive_geometry(80, 24, 0, 0, NULL, &geometry));
     CHECK(!kittyfb_derive_geometry(80, 24, 0, 0, &options, NULL));
@@ -482,6 +535,9 @@ test_packet_chunk_boundaries(void)
     CHECK(kittyfb_build_packet(
               packet, 512u, payload, 4096u,
               1, 2, 640, 400, "\x1b[1;1H", false) == 0u);
+    CHECK(kittyfb_build_packet(
+              packet, sizeof(packet), payload, 0u,
+              1, 2, 640, 400, "\x1b[1;1H", false) == 0u);
     return true;
 }
 
@@ -527,6 +583,9 @@ test_options_defaults(void)
     kittyfb_options options;
 
     kittyfb_options_init(&options);
+    CHECK(KITTYFB_VERSION_MAJOR == 0);
+    CHECK(KITTYFB_VERSION_MINOR == 4);
+    CHECK(KITTYFB_VERSION_PATCH == 0);
     CHECK(options.manage_raw_mode);
     CHECK(options.manage_alt_screen);
     CHECK(options.hide_cursor);
@@ -673,6 +732,7 @@ test_failure_snapshot_is_synchronized(void)
 typedef struct probe_replier {
     int master_fd;
     const char *reply;
+    int reply_delay_ms;
 } probe_replier;
 
 static void *
@@ -689,7 +749,7 @@ probe_replier_main(void *opaque)
         ready = poll(&descriptor, 1u, 3000);
     } while (ready < 0 && errno == EINTR);
     if (ready > 0) {
-        sleep_milliseconds(10);
+        sleep_milliseconds(replier->reply_delay_ms);
         (void)write(replier->master_fd, replier->reply,
                     strlen(replier->reply));
     }
@@ -724,6 +784,7 @@ start_with_fake_terminal(
 
     replier.master_fd = master;
     replier.reply = reply;
+    replier.reply_delay_ms = 10;
     if (pthread_create(&thread, NULL, probe_replier_main, &replier) != 0) {
         return -1;
     }
@@ -734,6 +795,24 @@ start_with_fake_terminal(
     }
     (void)pthread_join(thread, NULL);
     return result;
+}
+
+typedef struct signal_storm {
+    pthread_t target;
+    int started;
+} signal_storm;
+
+static void *
+signal_storm_main(void *opaque)
+{
+    signal_storm *storm = opaque;
+
+    __atomic_store_n(&storm->started, 1, __ATOMIC_RELEASE);
+    for (int sent = 0; sent < 220; ++sent) {
+        (void)pthread_kill(storm->target, SIGUSR1);
+        sleep_milliseconds(1);
+    }
+    return NULL;
 }
 
 static bool
@@ -906,6 +985,20 @@ wait_for_encoded_frames(kittyfb_session *session, uint64_t minimum)
 }
 
 static bool
+wait_for_failure(kittyfb_session *session)
+{
+    const int64_t deadline = monotonic_milliseconds() + 3000;
+
+    while (!kittyfb_failed(session)) {
+        if (monotonic_milliseconds() >= deadline) {
+            return false;
+        }
+        sleep_milliseconds(10);
+    }
+    return true;
+}
+
+static bool
 test_pty_lifecycle(void)
 {
     enum { FRAME_W = 32, FRAME_H = 16 };
@@ -1067,6 +1160,7 @@ test_pty_suspend_retains_buffers(void)
                               buffer, sizeof(buffer), &used));
     CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
                               buffer, sizeof(buffer), &used));
+    CHECK(wait_for_encoded_frames(&session, 2u));
     kittyfb_suspend(&session);
     CHECK(!session.active);
     CHECK(!session.presenter_started);
@@ -1090,11 +1184,14 @@ test_pty_suspend_retains_buffers(void)
     packet = session.packet_buffer;
     pending_capacity = session.pending_capacity;
     encode_capacity = session.encode_capacity;
-
     /* A second suspend changes nothing. */
     kittyfb_suspend(&session);
     CHECK(session.pending_buffer == pending);
     CHECK(session.encode_buffer == encoding);
+    CHECK(session.rgb_buffer == rgb);
+    CHECK(session.z_buffer == compressed);
+    CHECK(session.b64_buffer == base64);
+    CHECK(session.packet_buffer == packet);
     CHECK(session.pending_capacity == pending_capacity);
     CHECK(session.encode_capacity == encode_capacity);
 
@@ -1132,6 +1229,7 @@ test_pty_probe_rejects_da1_only_terminal(void)
     struct termios original;
     struct termios after;
     kittyfb_session session;
+    kittyfb_options options;
     int saved_errno = 0;
     static char buffer[8192];
     size_t used;
@@ -1139,12 +1237,16 @@ test_pty_probe_rejects_da1_only_terminal(void)
     CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, &original));
 
     /* This terminal answers device attributes but not the graphics
-     * query: start must fail cleanly with ENOTSUP, restore termios, and
-     * never touch the alternate screen. */
+    * query: start must fail cleanly with ENOTSUP, restore termios, and
+    * never touch the alternate screen. */
     kittyfb_session_init(&session);
-    CHECK(start_with_fake_terminal(&session, master, slave, NULL,
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_SHM;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
                                    da1_only_reply, &saved_errno) == -1);
     CHECK(saved_errno == ENOTSUP);
+    CHECK(session.shm_slots == NULL);
+    CHECK(session.shm_slot_count == 0);
     CHECK(tcgetattr(slave, &after) == 0);
     CHECK(same_termios(&original, &after));
 
@@ -1152,6 +1254,63 @@ test_pty_probe_rejects_da1_only_terminal(void)
     CHECK(contains_str(buffer, used, "\x1b_Gi=31,a=q"));
     CHECK(!contains_str(buffer, used, "\x1b[?1049h"));
 
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
+/* Signal interruptions may retry the probe read, but they must not restart
+ * its timeout window.  A deliberately late capable reply distinguishes a
+ * real monotonic deadline from one extended indefinitely by EINTR. */
+static bool
+test_pty_probe_timeout_survives_signal_storm(void)
+{
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    probe_replier replier;
+    signal_storm storm = {0};
+    pthread_t replier_thread;
+    pthread_t storm_thread;
+    struct sigaction action;
+    struct sigaction previous;
+    int result;
+    int saved_errno;
+
+    (void)memset(&action, 0, sizeof(action));
+    action.sa_handler = test_winch_handler;
+    CHECK(sigemptyset(&action.sa_mask) == 0);
+    CHECK(sigaction(SIGUSR1, &action, &previous) == 0);
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    options.probe_timeout_ms = 30;
+    replier.master_fd = master;
+    replier.reply = graphics_reply;
+    replier.reply_delay_ms = 150;
+    storm.target = pthread_self();
+    CHECK(pthread_create(&storm_thread, NULL, signal_storm_main, &storm) == 0);
+    CHECK(pthread_create(
+              &replier_thread, NULL, probe_replier_main, &replier) == 0);
+    while (!__atomic_load_n(&storm.started, __ATOMIC_ACQUIRE)) {
+        sleep_milliseconds(1);
+    }
+
+    errno = 0;
+    result = kittyfb_start(&session, slave, slave, &options);
+    saved_errno = errno;
+    if (result == 0) {
+        kittyfb_stop(&session);
+    }
+    CHECK(pthread_join(replier_thread, NULL) == 0);
+    CHECK(pthread_join(storm_thread, NULL) == 0);
+    CHECK(sigaction(SIGUSR1, &previous, NULL) == 0);
+
+    CHECK(result == -1);
+    CHECK(saved_errno == ENOTSUP);
     CHECK(close(master) == 0);
     CHECK(close(slave) == 0);
     return true;
@@ -1183,6 +1342,13 @@ test_pty_probe_disabled_starts_blind(void)
     CHECK(kittyfb_start(&session, slave, slave, &options) == -1);
     CHECK(errno == EINVAL);
     options.enter_sequence = NULL;
+    options.max_width = INT_MAX;
+    options.max_height = INT_MAX;
+    errno = 0;
+    CHECK(kittyfb_start(&session, slave, slave, &options) == -1);
+    CHECK(errno == EINVAL);
+    options.max_width = 1600;
+    options.max_height = 1000;
     CHECK(kittyfb_start(&session, slave, slave, &options) == 0);
 
     used = read_available(master, buffer, sizeof(buffer));
@@ -1252,11 +1418,58 @@ test_pty_emergency_restore(void)
     /* The session is inactive, a second emergency call is a no-op, and
      * stop still reclaims the presenter thread and its buffers. */
     CHECK(!kittyfb_present(&session, frame, FRAME_W, FRAME_H));
+    errno = 0;
+    CHECK(kittyfb_start(&session, slave, slave, &options) == -1);
+    CHECK(errno == EBUSY);
     kittyfb_emergency_restore(&session);
     kittyfb_stop(&session);
     CHECK(sigaction(SIGWINCH, NULL, &restored_winch) == 0);
     CHECK(restored_winch.sa_handler == test_winch_handler);
     CHECK(!session.winch_handler_installed);
+    CHECK(sigaction(SIGWINCH, &previous_winch, NULL) == 0);
+
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
+static bool
+test_pty_emergency_restore_before_present(void)
+{
+    int master = -1;
+    int slave = -1;
+    int original_flags;
+    struct sigaction previous_winch;
+    struct sigaction expected_winch;
+    struct sigaction restored_winch;
+    kittyfb_session session;
+    kittyfb_options options;
+
+    (void)memset(&expected_winch, 0, sizeof expected_winch);
+    expected_winch.sa_handler = test_winch_handler;
+    CHECK(sigemptyset(&expected_winch.sa_mask) == 0);
+    CHECK(sigaction(SIGWINCH, &expected_winch, &previous_winch) == 0);
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    original_flags = fcntl(slave, F_GETFL);
+    CHECK(original_flags >= 0);
+
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+
+    /* With no presenter thread or retained frame buffer, emergency cleanup
+     * still leaves signal-safe bookkeeping for the later ordinary stop. */
+    kittyfb_emergency_restore(&session);
+    CHECK(fcntl(slave, F_GETFL) == original_flags);
+    kittyfb_stop(&session);
+    CHECK(sigaction(SIGWINCH, NULL, &restored_winch) == 0);
+    CHECK(restored_winch.sa_handler == test_winch_handler);
+    CHECK(!session.winch_handler_installed);
+    CHECK(!session.output_flags_saved);
+    CHECK(!session.termios_saved);
     CHECK(sigaction(SIGWINCH, &previous_winch, NULL) == 0);
 
     CHECK(close(master) == 0);
@@ -1578,12 +1791,57 @@ test_pty_damage_patches_in_place(void)
     return true;
 }
 
+/* Kitty requires every continuation chunk of animation frame data to repeat
+ * a=f and the image id.  A one-chunk edit cannot catch that wire bug. */
+static bool
+test_pty_damage_multichunk_protocol(void)
+{
+    enum { FRAME_W = 128, FRAME_H = 128 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[262144];
+    size_t used = 0u;
+    kittyfb_rect rect = {0, 0, 40, 32};
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+    CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
+                              buffer, sizeof(buffer), &used));
+
+    fill_noise_frame(frame, FRAME_W, FRAME_H, UINT32_C(0x4b465231));
+    CHECK(kittyfb_present_damage(
+        &session, frame, FRAME_W, FRAME_H, &rect, 1u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+
+    CHECK(wire_has(buffer, used, "a=f,i=1,r=1,X=1"));
+    CHECK(wire_has(buffer, used, "s=40,v=32,m=1;"));
+    CHECK(count_bytes(buffer, used, "\x1b_Ga=f,i=1",
+                      strlen("\x1b_Ga=f,i=1")) >= 2u);
+    CHECK(wire_has(buffer, used, "\x1b_Ga=f,i=1,q=2,m=0;"));
+    CHECK(!wire_has(buffer, used, "\x1b_Gm="));
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
 /* Falling back rather than refusing is what lets a caller use this
  * unconditionally instead of reasoning about when it pays. */
 static bool
 test_pty_damage_falls_back(void)
 {
-    enum { FRAME_W = 64, FRAME_H = 48 };
+    enum { FRAME_W = 64, FRAME_H = 48, MANY_RECTS = 65 };
     int master = -1;
     int slave = -1;
     kittyfb_session session;
@@ -1593,6 +1851,7 @@ test_pty_damage_falls_back(void)
     static char buffer[262144];
     size_t used = 0u;
     kittyfb_rect rect;
+    kittyfb_rect many[MANY_RECTS];
 
     CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
     kittyfb_session_init(&session);
@@ -1626,6 +1885,44 @@ test_pty_damage_falls_back(void)
     CHECK(wire_has(buffer, used, "a=T"));
     kittyfb_get_stats(&session, &stats);
     CHECK(stats.damage_fallbacks == 2u);
+
+    /* An edit cannot be applied to a root frame of different dimensions. */
+    rect.x1 = 8;
+    rect.y1 = 8;
+    CHECK(kittyfb_present_damage(&session, frame, FRAME_W / 2, FRAME_H / 2,
+                                 &rect, 1u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=T"));
+
+    /* More rects than the bounded edit set must retransmit the whole newest
+     * frame, never silently ignore entries after the first 64. */
+    for (size_t i = 0u; i < sizeof(many) / sizeof(many[0]); ++i) {
+        many[i] = (kittyfb_rect){0, 0, 1, 1};
+    }
+    CHECK(kittyfb_present_damage(
+        &session, frame, FRAME_W, FRAME_H, many,
+        sizeof(many) / sizeof(many[0])));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=T"));
+
+    /* A centering-only resize sets clear_pending even when dimensions are
+     * unchanged. Damage must preserve that clear by falling back. */
+    pthread_mutex_lock(&session.frame_lock);
+    session.clear_pending = true;
+    pthread_mutex_unlock(&session.frame_lock);
+    CHECK(kittyfb_present_damage(
+        &session, frame, FRAME_W, FRAME_H, &rect, 1u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "\x1b[2J"));
+
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_fallbacks == 5u);
 
     kittyfb_stop(&session);
     (void)close(master);
@@ -1682,14 +1979,85 @@ test_pty_damage_rect_handling(void)
     kittyfb_get_stats(&session, &stats);
     CHECK(stats.damage_presents == 1u);
 
+    /* Adjacent rectangles with no gap carry the same pixels as their union.
+     * Coalesce them so one animation-frame edit replaces two headers and
+     * writes, while retaining the exact destination and extent. */
+    rects[0] = (kittyfb_rect){2, 3, 6, 7};
+    rects[1] = (kittyfb_rect){6, 3, 10, 7};
+    CHECK(kittyfb_present_damage(
+        &session, frame, FRAME_W, FRAME_H, rects, 2u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "x=2,y=3,s=8,v=4"));
+    CHECK(count_bytes(buffer, used, "r=1", 3u) == 1u);
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_presents == 2u);
+
     /* Bad arguments still fail. */
     CHECK(!kittyfb_present_damage(NULL, frame, FRAME_W, FRAME_H, rects, 1u));
     CHECK(!kittyfb_present_damage(&session, NULL, FRAME_W, FRAME_H, rects, 1u));
     CHECK(!kittyfb_present_damage(&session, frame, 0, FRAME_H, rects, 1u));
+    CHECK(!kittyfb_present_damage(&session, frame, FRAME_W, FRAME_H, NULL, 1u));
+    CHECK(!kittyfb_present_damage(
+        &session, frame, INT_MAX, INT_MAX, rects, 1u));
 
     kittyfb_stop(&session);
     (void)close(master);
     (void)close(slave);
+    return true;
+}
+
+/* A damage call immediately after queueing a full frame is the ordinary
+ * editor workload and used to race the presenter's scratch buffers/output.
+ * Keep a terminal reader active so both paths can run under ThreadSanitizer. */
+static bool
+test_pty_damage_serializes_with_presenter(void)
+{
+    enum { FRAME_W = 320, FRAME_H = 180, ITERATIONS = 24 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    wire_drainer drainer = {0};
+    pthread_t reader;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[1048576];
+    size_t used = 0u;
+    kittyfb_rect rect = {0, 0, 32, 32};
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+    CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
+                              buffer, sizeof(buffer), &used));
+
+    drainer.fd = master;
+    CHECK(pthread_create(&reader, NULL, wire_drainer_main, &drainer) == 0);
+    for (uint32_t iteration = 0u; iteration < ITERATIONS; ++iteration) {
+        fill_noise_frame(frame, FRAME_W, FRAME_H,
+                         UINT32_C(0x9e3779b9) ^ iteration);
+        CHECK(kittyfb_present(&session, frame, FRAME_W, FRAME_H));
+        CHECK(kittyfb_present_damage(
+            &session, frame, FRAME_W, FRAME_H, &rect, 1u));
+    }
+    kittyfb_suspend(&session);
+    __atomic_store_n(&drainer.stop, 1, __ATOMIC_RELEASE);
+    CHECK(pthread_join(reader, NULL) == 0);
+    CHECK(drainer.bytes > 0u);
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.frames_encoded > 0u);
+    CHECK(stats.encode_failures == 0u);
+    CHECK(!kittyfb_failed(&session));
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
     return true;
 }
 
@@ -1708,6 +2076,7 @@ test_pty_shm_transport(void)
     char name_a[128];
     char name_b[128];
     char name_c[128];
+    int probe_fd;
     size_t used;
 
     CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
@@ -1784,12 +2153,19 @@ test_pty_shm_transport(void)
     CHECK(present_and_capture(&session, master, frame_b, FRAME_W, FRAME_H, 9u,
                               buffer, sizeof(buffer), &used));
     CHECK(extract_shm_name(buffer, used, name_b, sizeof(name_b)));
-    CHECK(shm_open(name_b, O_RDONLY, 0) >= 0);
+    probe_fd = shm_open(name_b, O_RDONLY, 0);
+    CHECK(probe_fd >= 0);
+    CHECK(close(probe_fd) == 0);
 
-    kittyfb_stop(&session);
+    kittyfb_suspend(&session);
+    /* Suspension retains heap high-water buffers but releases every tmpfs
+     * mapping; a stopped job may remain suspended indefinitely. */
+    CHECK(session.shm_slots == NULL);
+    CHECK(session.shm_slot_count == 0);
     /* Teardown unlinks every slot, consumed or not: a slot left behind
      * leaks a frame of tmpfs until the next reboot. */
     CHECK(shm_open(name_b, O_RDONLY, 0) < 0);
+    kittyfb_stop(&session);
 
     CHECK(close(master) == 0);
     CHECK(close(slave) == 0);
@@ -1850,9 +2226,78 @@ test_pty_shm_saturation_drops(void)
     CHECK(stats.encode_failures == 0u);
     CHECK(stats.frames_encoded <= (uint64_t)SLOTS);
 
-    /* Presenting still succeeds afterwards: dropping is not failing. */
+    /* A resize clear belongs to the next frame that actually reaches the
+     * terminal.  A saturated ring must not consume it with a dropped frame. */
+    pthread_mutex_lock(&session.frame_lock);
+    session.clear_pending = true;
+    pthread_mutex_unlock(&session.frame_lock);
+    kittyfb_get_stats(&session, &stats);
+    uint64_t dropped_before_clear = stats.frames_dropped;
     CHECK(kittyfb_present(&session, frame, FRAME_W, FRAME_H));
+    CHECK(wait_for_dropped_frames(&session, dropped_before_clear + 1u));
+    pthread_mutex_lock(&session.frame_lock);
+    CHECK(session.clear_pending);
+    pthread_mutex_unlock(&session.frame_lock);
 
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
+/* Once a slot is populated, any later packet/build/write failure must unlink
+ * and release it. Otherwise no terminal received the name and the ring loses
+ * that slot forever. */
+static bool
+test_pty_shm_publish_failure_rolls_back(void)
+{
+    enum { FRAME_W = 16, FRAME_H = 8 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_SHM;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    if (kittyfb_active_transport(&session) != KITTYFB_TRANSPORT_SHM) {
+        (void)fprintf(stderr,
+                      "  SKIPPED: shared memory unavailable in this "
+                      "environment\n");
+        kittyfb_stop(&session);
+        CHECK(close(master) == 0);
+        CHECK(close(slave) == 0);
+        return true;
+    }
+    drain_descriptor(master);
+
+    /* Fault-inject an inconsistent packet allocation: growth believes the
+     * capacity exists, then the builder safely rejects the NULL output. */
+    CHECK(session.packet_buffer == NULL);
+    session.packet_capacity = 1024u;
+    CHECK(kittyfb_present(&session, frame, FRAME_W, FRAME_H));
+    CHECK(wait_for_failure(&session));
+
+    pthread_mutex_lock(&session.frame_lock);
+    for (int index = 0; index < session.shm_slot_count; ++index) {
+        int fd;
+
+        CHECK(!session.shm_slots[index].busy);
+        CHECK(session.shm_slots[index].fd == -1);
+        CHECK(session.shm_slots[index].mapping == NULL);
+        fd = shm_open(session.shm_slots[index].name, O_RDONLY, 0);
+        CHECK(fd < 0 && errno == ENOENT);
+    }
+    session.packet_capacity = 0u;
+    pthread_mutex_unlock(&session.frame_lock);
+
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.encode_failures == 1u);
     kittyfb_stop(&session);
     CHECK(close(master) == 0);
     CHECK(close(slave) == 0);
@@ -1980,24 +2425,42 @@ main(void)
         {"PTY suspend retains buffers", test_pty_suspend_retains_buffers},
         {"PTY probe rejects DA1-only terminal",
          test_pty_probe_rejects_da1_only_terminal},
+        {"PTY probe timeout survives signal storm",
+         test_pty_probe_timeout_survives_signal_storm},
         {"PTY probe disabled starts blind",
          test_pty_probe_disabled_starts_blind},
         {"PTY emergency restore", test_pty_emergency_restore},
+        {"PTY emergency before present",
+         test_pty_emergency_restore_before_present},
         {"PTY resize", test_pty_resize},
         {"PTY origin is the centering offset",
          test_pty_origin_is_the_centering_offset},
         {"PTY frames and patches from two threads",
          test_pty_frames_and_patches_from_two_threads},
         {"PTY damage patches in place", test_pty_damage_patches_in_place},
+        {"PTY damage multichunk protocol",
+         test_pty_damage_multichunk_protocol},
         {"PTY damage falls back", test_pty_damage_falls_back},
         {"PTY damage rect handling", test_pty_damage_rect_handling},
+        {"PTY damage serializes with presenter",
+         test_pty_damage_serializes_with_presenter},
         {"PTY shm transport", test_pty_shm_transport},
         {"PTY shm saturation drops", test_pty_shm_saturation_drops},
+        {"PTY shm publish failure rolls back",
+         test_pty_shm_publish_failure_rolls_back},
         {"shm AUTO declines under tmux", test_shm_auto_declines_under_tmux},
         {"shm reap orphans", test_shm_reap_orphans}
     };
     size_t passed = 0u;
     size_t index;
+
+    /* The public overrides are useful interactively but must not silently
+     * select different transports or bypass probes in a test process. */
+    if (unsetenv("KITTYFB_TRANSPORT") != 0 ||
+        unsetenv("KITTYFB_SKIP_PROBE") != 0 || unsetenv("TMUX") != 0) {
+        (void)perror("unsetenv");
+        return 1;
+    }
 
     for (index = 0u; index < sizeof(tests) / sizeof(tests[0]); ++index) {
         const bool ok = tests[index].function();

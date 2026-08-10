@@ -27,7 +27,7 @@ extern "C" {
 #endif
 
 #define KITTYFB_VERSION_MAJOR 0
-#define KITTYFB_VERSION_MINOR 3
+#define KITTYFB_VERSION_MINOR 4
 #define KITTYFB_VERSION_PATCH 0
 #define KITTYFB_CONTROL_SEQUENCE_MAX 64
 
@@ -79,8 +79,8 @@ typedef struct kittyfb_options {
      * attributes request before drawing anything.  Terminals without
      * graphics support still answer the DA1, which bounds the wait.
      * When the terminal does not answer the graphics query, start fails
-     * with errno = ENOTSUP.  Default true.  The environment variable
-     * KITTYFB_SKIP_PROBE=1 also skips the probe. */
+     * with errno = ENOTSUP.  Default true.  The presence of the
+     * KITTYFB_SKIP_PROBE environment variable also skips the probe. */
     bool probe_graphics;
 
     /* Install a SIGWINCH handler that flags a pending resize check.
@@ -318,13 +318,19 @@ typedef struct kittyfb_rect {
  * Falls back to a full kittyfb_present() automatically when:
  *
  *   - nothing has been presented yet, so there is no image to edit;
+ *   - a full frame is pending/in flight, resize requires a clear, or the
+ *     displayed frame has different dimensions;
  *   - the damaged area exceeds a fraction of the frame where patching
  *     stops paying (many small rects cost more in per-rect overhead than
  *     one clean frame);
  *   - the active transport cannot express an edit.
  *
  * That fallback is why a caller can use this unconditionally and does
- * not have to reason about when it helps.
+ * not have to reason about when it helps.  Cost-free overlapping or
+ * adjacent rectangles are coalesced before that decision.
+ *
+ * This call is synchronous and serializes with the asynchronous full-frame
+ * encoder/writer; the final on-screen result therefore follows API call order.
  *
  * Returns false on invalid arguments, an inactive session, or a latched
  * presenter failure.  Rects are clamped to the framebuffer; empty or
@@ -371,10 +377,12 @@ int kittyfb_reap_orphans(void);
 
 /*
  * Join the presenter and restore the terminal while retaining all
- * high-water frame and encoder buffers.  Use before process suspension,
- * then call kittyfb_start() after continuation.  A later kittyfb_stop()
- * releases the retained storage even if the session was not restarted.
- * Safe to call twice.
+ * high-water heap frame and encoder buffers.  Shared-memory mappings are
+ * released rather than pinning tmpfs while the process is stopped.  Use
+ * before process suspension, then call kittyfb_start() after continuation;
+ * that start recreates the ring and re-resolves the transport.  A later
+ * kittyfb_stop() releases retained storage even if the session was not
+ * restarted.  Safe to call twice.
  */
 void kittyfb_suspend(kittyfb_session *session);
 

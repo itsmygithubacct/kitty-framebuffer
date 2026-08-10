@@ -35,7 +35,7 @@ for video it is the whole budget.
 `options.transport` selects between them and defaults to
 `KITTYFB_TRANSPORT_AUTO`, which picks shared memory when `shm_open()`
 works and the session is not under tmux, and inline otherwise. The
-decision is made once, in `kittyfb_start()`;
+decision is made once per start, in `kittyfb_start()`;
 `kittyfb_active_transport()` reports what it chose. tmux disqualifies
 shared memory even when `shm_open()` succeeds, because tmux forwards the
 escape to a terminal that need not share this process's `/dev/shm` - and
@@ -75,16 +75,21 @@ the caller's composition is unchanged, and the library can decide from the
 damaged area whether patching is even the cheaper option.
 
 It falls back to a full present automatically when nothing has been presented
-yet, when the shared-memory transport is active (which has no per-rect form), or
-when the damage covers enough of the frame that per-rect overhead costs more
-than one clean transmission. That fallback is the point: a caller can use it
-unconditionally instead of reasoning about when it helps.
+yet, when a full frame is pending or in flight, when a resize clear is pending,
+when the displayed image has different dimensions, when the shared-memory
+transport is active (which has no per-rect form), or when the damage is too
+large or scattered for patches to pay. Overlapping and adjacent rectangles are
+coalesced when their bounding rectangle sends no extra pixels. That fallback is
+the point: a caller can use the function unconditionally instead of reasoning
+about when it helps.
 
 **It is synchronous, unlike `kittyfb_present()`.** The presenter thread keeps
 only the newest pending frame and drops the rest — correct for video, where a
 dropped frame is one nobody needed, and corrupting for patches, where each
 carries only its own rectangles and a dropped one leaves that region wrong until
-something else redraws it.
+something else redraws it. Damage and full-frame writes share one serializer, so
+the final on-screen result follows API call order and their protocol bytes cannot
+interleave.
 
 ## Build and test
 
@@ -92,10 +97,13 @@ something else redraws it.
 make
 make test
 make sanitize
+make benchmark
 ./build/bounce
 ```
 
-The final command runs an animated example (a bouncing ball over a
+`make benchmark` reports base64 and packet throughput plus full-frame, enqueue,
+and damage-present timings against a drained PTY. The final command runs an
+animated example (a bouncing ball over a
 scrolling gradient at ~30 fps; `q` or Ctrl-C quits). It needs a terminal
 that implements the Kitty graphics protocol: kitty, ghostty, wezterm, or
 a recent konsole. The test suite runs anywhere; it covers the base64,
@@ -162,10 +170,11 @@ new frame arrives while the previous one is still encoding, the pending
 frame is replaced (counted in `frames_dropped`). If the presenter thread
 cannot be created, the frame is encoded synchronously on the caller.
 
-Frames may be any size; most applications present at the size the
-library chose. All size arithmetic is overflow-checked and every buffer
-growth is verified, so oversized or hostile dimensions fail cleanly with
-`false` rather than corrupting memory.
+Frames may be any size representable as one C object; most applications present
+at the size the library chose. All size arithmetic is overflow-checked, objects
+larger than `PTRDIFF_MAX` are rejected, and every buffer growth is verified, so
+oversized or hostile dimensions fail cleanly with `false` rather than attempting
+an impossible allocation or corrupting memory.
 
 ## Resize handling
 
@@ -186,8 +195,10 @@ SIGWINCH can set `install_winch_handler = false` and optionally call
 `kittyfb_suspend()` joins the presenter and restores the terminal but retains
 the frame and encoder buffers at their high-water capacities. Call
 `kittyfb_start()` after continuation; repeated job-control cycles then reuse
-the large allocations. A final `kittyfb_stop()` releases retained storage
-whether or not the session was restarted.
+the large heap allocations. Shared-memory slots and their tmpfs mappings are
+released during suspension and recreated on the next start, which also
+re-resolves changed transport options and environment. A final `kittyfb_stop()`
+releases retained storage whether or not the session was restarted.
 
 `kittyfb_stop()` joins the presenter thread, frees its buffers, and
 restores the terminal: it ends any pending synchronized update *first*
@@ -228,15 +239,17 @@ everything it changed - the deliberate behavior for unsupported
 terminals, matching the game family this library was extracted from.
 To run anyway (for example through a passthrough multiplexer), set
 `options.probe_graphics = false` or the environment variable
-`KITTYFB_SKIP_PROBE=1`; frames are then written blind.
+`KITTYFB_SKIP_PROBE` (conventionally `KITTYFB_SKIP_PROBE=1`); frames are then
+written blind. Probe reads use one monotonic deadline, so repeated signals do
+not extend the configured timeout indefinitely.
 
 ## Diagnostics
 
-`kittyfb_get_stats()` snapshots frames presented, encoded, dropped, and
-encode failures. When compression, allocation, or the terminal write
-fails on the presenter thread, the failure latches: `kittyfb_present()`
-returns false from then on and `kittyfb_failed()` reports it, so the
-application can exit its render loop instead of animating into a void.
+`kittyfb_get_stats()` snapshots frames presented, encoded, and dropped; encode
+failures; and damage presents, fallbacks, and bytes. When compression,
+allocation, or the terminal write fails, the failure latches:
+`kittyfb_present()` returns false from then on and `kittyfb_failed()` reports it,
+so the application can exit its render loop instead of animating into a void.
 The latch clears on the next start.
 
 ## Composing with kitty-keyboard
