@@ -6,6 +6,13 @@
   overlapping same-frame replacement composition and patch the exposed strips;
   standard terminals and unsafe or uneconomical states retain the full-frame
   fallback.
+- Add `kittyfb_present_scroll_region()` so document/editor content can scroll
+  inside a clipped viewport without shifting or retransmitting fixed chrome.
+- Place framebuffer images below `INT32_MIN / 2`, underneath non-default cell
+  backgrounds and terminal foreground UI, so Kilix's software mouse cursor
+  remains visible over full-window graphics.
+- Correct multi-chunk `a=f` continuations: repeat the action but not the image
+  id, which Kitty rejects on continuation packets.
 - Permit inline `a=f` damage patches after a full image was delivered through
   shared memory, retaining the cheapest transport for both update sizes.
 - Add scroll presentation, fallback, byte, mixed-transport, and wire-protocol

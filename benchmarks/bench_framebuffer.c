@@ -346,7 +346,7 @@ static bool benchmark_presenter(void)
                      (double)elapsed / 1.0e6 / repetitions);
     }
     {
-        const kittyfb_rect toolbar = {0, 0, WIDTH, 32};
+        const kittyfb_rect viewport = {0, 32, WIDTH, HEIGHT};
         const int repetitions = 100;
 
         if (setenv("KITTY_KILIX_RENDERING", "1", 1) != 0) {
@@ -356,8 +356,9 @@ static bool benchmark_presenter(void)
         for (int run = 0; run < repetitions; ++run) {
             int dy = (run & 1) == 0 ? -24 : 24;
 
-            if (!kittyfb_present_scroll(
-                    &session, frame, WIDTH, HEIGHT, 0, dy, &toolbar, 1u)) {
+            if (!kittyfb_present_scroll_region(
+                    &session, frame, WIDTH, HEIGHT, &viewport,
+                    0, dy, NULL, 0u)) {
                 goto stop_reader;
             }
         }

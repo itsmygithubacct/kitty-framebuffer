@@ -372,6 +372,29 @@ bool kittyfb_present_scroll(
     size_t extra_rect_count);
 
 /*
+ * Like kittyfb_present_scroll(), but shift only scroll_region.  Pixels outside
+ * that rectangle are retained in place, so fixed toolbars, sidebars, and other
+ * chrome need no repair patch.  Newly exposed strips are clipped to the region;
+ * extra_rects remains available for independent changes elsewhere in the
+ * frame.  The region is clamped to the framebuffer and x1/y1 are exclusive.
+ *
+ * This is the preferred form for document and editor viewports: it preserves
+ * the terminal's retained pixels exactly where the application preserves them,
+ * reducing both protocol traffic and the number of states that must be composed
+ * atomically.  The same capability checks and full-frame fallback apply.
+ */
+bool kittyfb_present_scroll_region(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    const kittyfb_rect *scroll_region,
+    int dx,
+    int dy,
+    const kittyfb_rect *extra_rects,
+    size_t extra_rect_count);
+
+/*
  * Re-read the terminal size and re-derive the framebuffer geometry.
  * Cheap; call once per frame.  Returns true - with the new size stored
  * through width/height when non-NULL - only when the framebuffer pixel

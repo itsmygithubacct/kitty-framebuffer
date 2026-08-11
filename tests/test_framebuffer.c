@@ -495,9 +495,9 @@ test_packet_chunk_boundaries(void)
     size_t length;
     size_t header_end;
     static const char header_4096[] =
-        "\x1b_Ga=T,f=24,i=1,q=2,o=z,s=640,v=400,m=0;";
+        "\x1b_Ga=T,f=24,i=1,q=2,o=z,s=640,v=400,z=-1073741825,m=0;";
     static const char header_more[] =
-        "\x1b_Ga=T,f=24,i=1,q=2,o=z,s=640,v=400,m=1;";
+        "\x1b_Ga=T,f=24,i=1,q=2,o=z,s=640,v=400,z=-1073741825,m=1;";
 
     (void)memset(payload, 'A', sizeof(payload));
 
@@ -558,7 +558,7 @@ test_packet_wrapper_and_delete(void)
     CHECK(starts_with(packet, length, cleared_prefix));
     CHECK(contains_str(
         packet, length,
-        "\x1b_Ga=T,f=24,i=7,q=2,o=z,s=320,v=200,m=0;AAAA\x1b\\"));
+        "\x1b_Ga=T,f=24,i=7,q=2,o=z,s=320,v=200,z=-1073741825,m=0;AAAA\x1b\\"));
     CHECK(ends_with(packet, length, trailer));
 
     length = kittyfb_build_packet(
@@ -622,7 +622,7 @@ test_shm_packet_shape(void)
         (const uint8_t *)name, strlen(name), encoded);
     CHECK(encoded_length > 0u);
     CHECK((size_t)snprintf(expected, sizeof(expected),
-                           "\x1b_Ga=T,f=32,i=1,q=2,t=s,s=320,v=180;%.*s\x1b\\",
+                           "\x1b_Ga=T,f=32,i=1,q=2,t=s,s=320,v=180,z=-1073741825;%.*s\x1b\\",
                            (int)encoded_length, encoded) < sizeof(expected));
     CHECK(contains_str(packet, length, expected));
 
@@ -1045,7 +1045,7 @@ test_pty_lifecycle(void)
                               buffer, sizeof(buffer), &used));
     CHECK(starts_with(buffer, used, "\x1b[?2026h\x1b[1;1H"));
     CHECK(decoded_payload_matches(
-        buffer, used, "\x1b_Ga=T,f=24,i=1,q=2,o=z,s=32,v=16,m=0;",
+        buffer, used, "\x1b_Ga=T,f=24,i=1,q=2,o=z,s=32,v=16,z=-1073741825,m=0;",
         frame, FRAME_W, FRAME_H));
     CHECK(contains_str(buffer, used, "\x1b_Ga=d,d=I,i=2,q=2\x1b\\"));
 
@@ -1053,7 +1053,7 @@ test_pty_lifecycle(void)
     CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 3u,
                               buffer, sizeof(buffer), &used));
     CHECK(contains_str(buffer, used,
-                       "\x1b_Ga=T,f=24,i=2,q=2,o=z,s=32,v=16,m=0;"));
+                       "\x1b_Ga=T,f=24,i=2,q=2,o=z,s=32,v=16,z=-1073741825,m=0;"));
     CHECK(contains_str(buffer, used, "\x1b_Ga=d,d=I,i=1,q=2\x1b\\"));
 
     /* Absurd dimensions are rejected without disturbing the session. */
@@ -1116,7 +1116,7 @@ test_pty_start_after_stop(void)
     CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 0u,
                               buffer, sizeof(buffer), &used));
     CHECK(contains_str(buffer, used,
-                       "\x1b_Ga=T,f=24,i=1,q=2,o=z,s=16,v=8,m=0;"));
+                       "\x1b_Ga=T,f=24,i=1,q=2,o=z,s=16,v=8,z=-1073741825,m=0;"));
     CHECK(contains_str(buffer, used, "\x1b_Ga=d,d=I,i=2,q=2\x1b\\"));
 
     kittyfb_stop(&session);
@@ -1792,7 +1792,8 @@ test_pty_damage_patches_in_place(void)
 }
 
 /* Kitty requires every continuation chunk of animation frame data to repeat
- * a=f and the image id.  A one-chunk edit cannot catch that wire bug. */
+ * a=f, while allowing only a=f, m, and optional q. A one-chunk edit cannot
+ * catch either omission of a=f or an illegal repeated image id. */
 static bool
 test_pty_damage_multichunk_protocol(void)
 {
@@ -1825,9 +1826,10 @@ test_pty_damage_multichunk_protocol(void)
 
     CHECK(wire_has(buffer, used, "a=f,i=1,r=1,X=1"));
     CHECK(wire_has(buffer, used, "s=40,v=32,m=1;"));
-    CHECK(count_bytes(buffer, used, "\x1b_Ga=f,i=1",
-                      strlen("\x1b_Ga=f,i=1")) >= 2u);
-    CHECK(wire_has(buffer, used, "\x1b_Ga=f,i=1,q=2,m=0;"));
+    CHECK(count_bytes(buffer, used, "\x1b_Ga=f,q=2,m=",
+                      strlen("\x1b_Ga=f,q=2,m=")) >= 1u);
+    CHECK(wire_has(buffer, used, "\x1b_Ga=f,q=2,m=0;"));
+    CHECK(!wire_has(buffer, used, "\x1b_Ga=f,i=1,q=2,m="));
     CHECK(!wire_has(buffer, used, "\x1b_Gm="));
 
     kittyfb_stop(&session);
@@ -1904,6 +1906,7 @@ test_pty_scroll_compose_and_fallback(void)
     static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
     static char buffer[262144];
     size_t used = 0u;
+    kittyfb_rect viewport = {0, 2, FRAME_W, FRAME_H};
     kittyfb_rect toolbar = {0, 0, FRAME_W, 2};
 
     CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
@@ -1915,31 +1918,44 @@ test_pty_scroll_compose_and_fallback(void)
     drain_descriptor(master);
     CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
                               buffer, sizeof(buffer), &used));
+    CHECK(wire_has(buffer, used, "z=-1073741825"));
 
     CHECK(setenv("KITTY_KILIX_RENDERING", "1", 1) == 0);
     fill_test_frame(frame, FRAME_W, FRAME_H, 2u);
-    CHECK(kittyfb_present_scroll(
-        &session, frame, FRAME_W, FRAME_H, 0, -4, &toolbar, 1u));
+    CHECK(kittyfb_present_scroll_region(
+        &session, frame, FRAME_W, FRAME_H, &viewport,
+        0, -4, NULL, 0u));
     used = 0u;
     CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
                          "\x1b[?2026l", 8u));
     CHECK(wire_has(buffer, used, "a=c,i=1,r=1,c=1"));
-    CHECK(wire_has(buffer, used, "x=0,y=0,X=0,Y=4,w=64,h=44"));
+    CHECK(wire_has(buffer, used, "x=0,y=2,X=0,Y=6,w=64,h=42"));
     CHECK(wire_has(buffer, used, "C=1,N=2,q=2"));
     CHECK(wire_has(buffer, used, "a=f"));
     CHECK(wire_has(buffer, used, "x=0,y=44,s=64,v=4"));
-    CHECK(wire_has(buffer, used, "x=0,y=0,s=64,v=2"));
+    CHECK(!wire_has(buffer, used, "x=0,y=0,s=64,v=2"));
     CHECK(!wire_has(buffer, used, "a=T"));
     kittyfb_get_stats(&session, &stats);
     CHECK(stats.scroll_presents == 1u);
     CHECK(stats.scroll_fallbacks == 0u);
     CHECK(stats.scroll_bytes > 0u);
 
+    /* The original API remains a whole-frame convenience wrapper. */
+    fill_test_frame(frame, FRAME_W, FRAME_H, 3u);
+    CHECK(kittyfb_present_scroll(
+        &session, frame, FRAME_W, FRAME_H, 0, 4, &toolbar, 1u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "x=0,y=4,X=0,Y=0,w=64,h=44"));
+    CHECK(wire_has(buffer, used, "x=0,y=0,s=64,v=4"));
+    CHECK(!wire_has(buffer, used, "a=T"));
+
     /* The environment marker is capability negotiation.  Without it a
      * standard Kitty-compatible terminal receives a complete frame and can
      * never be left with a rejected fork-only compose command. */
     CHECK(unsetenv("KITTY_KILIX_RENDERING") == 0);
-    fill_test_frame(frame, FRAME_W, FRAME_H, 3u);
+    fill_test_frame(frame, FRAME_W, FRAME_H, 4u);
     CHECK(kittyfb_present_scroll(
         &session, frame, FRAME_W, FRAME_H, 0, -4, NULL, 0u));
     used = 0u;
@@ -1948,13 +1964,15 @@ test_pty_scroll_compose_and_fallback(void)
     CHECK(wire_has(buffer, used, "a=T"));
     CHECK(!wire_has(buffer, used, "a=c"));
     kittyfb_get_stats(&session, &stats);
-    CHECK(stats.scroll_presents == 1u);
+    CHECK(stats.scroll_presents == 2u);
     CHECK(stats.scroll_fallbacks == 1u);
 
     CHECK(!kittyfb_present_scroll(
         &session, NULL, FRAME_W, FRAME_H, 0, -4, NULL, 0u));
     CHECK(!kittyfb_present_scroll(
         &session, frame, FRAME_W, FRAME_H, 0, -4, NULL, 1u));
+    CHECK(!kittyfb_present_scroll_region(
+        &session, frame, FRAME_W, FRAME_H, NULL, 0, -4, NULL, 0u));
 
     kittyfb_stop(&session);
     CHECK(close(master) == 0);
@@ -2235,7 +2253,7 @@ test_pty_shm_transport(void)
     CHECK(present_and_capture(&session, master, frame_a, FRAME_W, FRAME_H, 0u,
                               buffer, sizeof(buffer), &used));
     CHECK(starts_with(buffer, used, "\x1b[?2026h\x1b[1;1H"));
-    CHECK(contains_str(buffer, used, "\x1b_Ga=T,f=32,i=1,q=2,t=s,s=32,v=16;"));
+    CHECK(contains_str(buffer, used, "\x1b_Ga=T,f=32,i=1,q=2,t=s,s=32,v=16,z=-1073741825;"));
     CHECK(contains_str(buffer, used, "\x1b_Ga=d,d=I,i=2,q=2\x1b\\"));
     CHECK(!contains_str(buffer, used, "o=z"));
 
@@ -2250,7 +2268,7 @@ test_pty_shm_transport(void)
      * contents changed under it. */
     CHECK(present_and_capture(&session, master, frame_b, FRAME_W, FRAME_H, 3u,
                               buffer, sizeof(buffer), &used));
-    CHECK(contains_str(buffer, used, "\x1b_Ga=T,f=32,i=2,q=2,t=s,s=32,v=16;"));
+    CHECK(contains_str(buffer, used, "\x1b_Ga=T,f=32,i=2,q=2,t=s,s=32,v=16,z=-1073741825;"));
     CHECK(contains_str(buffer, used, "\x1b_Ga=d,d=I,i=1,q=2\x1b\\"));
     CHECK(extract_shm_name(buffer, used, name_b, sizeof(name_b)));
     CHECK(strcmp(name_b, name_a) != 0);

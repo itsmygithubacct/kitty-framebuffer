@@ -94,18 +94,22 @@ interleave.
 
 ## Scroll composition
 
-`kittyfb_present_scroll()` handles a common retained-image update without
+`kittyfb_present_scroll_region()` handles a common retained-image update without
 retransmitting pixels that merely moved. The caller supplies the complete new
-frame and the `(dx, dy)` shift from the previous frame. The library asks the
-Kilix Kitty fork to compose the overlapping interior in place with `a=c,C=1,N=2`
-and patches the newly exposed edge strips from the new frame. Extra damage
-rectangles can cover fixed chrome or any change not explained by the shift.
+frame, a viewport, and the `(dx, dy)` shift from the previous frame. The library
+asks the Kilix Kitty fork to compose only that viewport's overlapping interior
+in place with `a=c,C=1,N=2` and patches its newly exposed edge strips from the
+new frame. Pixels outside the viewport stay put, so fixed chrome is neither
+shifted nor retransmitted. Extra damage rectangles can cover independent changes.
 
 ```c
-kittyfb_rect toolbar = {0, 0, width, toolbar_height};
-kittyfb_present_scroll(&session, rgba, width, height,
-                       0, -scroll_pixels, &toolbar, 1);
+kittyfb_rect viewport = {0, toolbar_height, width, height};
+kittyfb_present_scroll_region(&session, rgba, width, height, &viewport,
+                              0, -scroll_pixels, NULL, 0);
 ```
+
+`kittyfb_present_scroll()` remains the whole-frame convenience form for scenes
+where every retained pixel moves together.
 
 The `KITTY_KILIX_RENDERING=1` marker is the capability negotiation for the
 fork extension. Without it, before an initial frame, across a resize or queued
@@ -114,6 +118,12 @@ falls back to a normal full presentation. On the fork, the terminal performs
 the compose on a hardware GPU when available and uses its existing CPU upload
 path otherwise; either route has the same snapshot/memmove result. Compose and
 patch packets are synchronous and share the full-frame serializer.
+
+Framebuffer placements use a z-index below `INT32_MIN / 2`: the image remains
+above the default canvas but below non-default cell backgrounds and terminal
+foreground UI. That keeps Kilix's software mouse cursor visible over full-window
+graphics while retaining the native OS-pointer fallback on terminals that do
+not provide one.
 
 ## Build and test
 

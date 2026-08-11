@@ -292,7 +292,7 @@ size_t kittyfb_build_packet(
             printed = snprintf(
                 at,
                 remaining,
-                "\x1b_Ga=T,f=24,i=%d,q=2,o=z,s=%d,v=%d,m=%d;",
+                "\x1b_Ga=T,f=24,i=%d,q=2,o=z,s=%d,v=%d,z=-1073741825,m=%d;",
                 new_id,
                 width,
                 height,
@@ -377,7 +377,7 @@ size_t kittyfb_build_shm_packet(
     printed = snprintf(
         at,
         remaining,
-        "\x1b_Ga=T,f=32,i=%d,q=2,t=s,s=%d,v=%d;%.*s\x1b\\",
+        "\x1b_Ga=T,f=32,i=%d,q=2,t=s,s=%d,v=%d,z=-1073741825;%.*s\x1b\\",
         new_id,
         width,
         height,
@@ -2174,8 +2174,9 @@ static bool write_damage_rect(
         session->z_buffer, (size_t)z_length, session->b64_buffer);
 
     /* Build a rect into one contiguous write rather than issuing three
-     * syscalls per 4 KiB chunk.  The protocol requires every continuation
-     * of animation frame data to repeat both a=f and the image id. */
+     * syscalls per 4 KiB chunk.  Animation-frame continuations must repeat
+     * a=f, but the protocol permits only a=f, m, and optional q after the
+     * first chunk.  In particular, repeating the image id aborts the load. */
     {
         size_t chunk_count =
             (encoded_length - 1u) / KITTYFB_CHUNK_SIZE + 1u;
@@ -2215,8 +2216,7 @@ static bool write_damage_rect(
                 first = false;
             } else {
                 printed = snprintf(
-                    at, remaining, "\x1b_Ga=f,i=%d,q=2,m=%d;",
-                    image_id, more);
+                    at, remaining, "\x1b_Ga=f,q=2,m=%d;", more);
             }
             if (printed < 0 || (size_t)printed >= remaining) {
                 return false;
@@ -2391,11 +2391,12 @@ static bool present_scroll_fallback(
     return kittyfb_present(session, rgba, width, height);
 }
 
-bool kittyfb_present_scroll(
+bool kittyfb_present_scroll_region(
     kittyfb_session *session,
     const uint8_t *rgba,
     int width,
     int height,
+    const kittyfb_rect *scroll_region,
     int dx,
     int dy,
     const kittyfb_rect *extra_rects,
@@ -2421,13 +2422,20 @@ bool kittyfb_present_scroll(
     int dest_y;
     int copy_width;
     int copy_height;
+    int region_width;
+    int region_height;
+    kittyfb_rect region;
     char compose[224];
     int compose_length;
 
     if (session == NULL || !session->active || rgba == NULL ||
         !frame_byte_count(width, height, &rgba_length) ||
+        scroll_region == NULL ||
         (extra_rect_count > 0u && extra_rects == NULL)) {
         return false;
+    }
+    if (!damage_rect_valid(scroll_region, width, height, &region)) {
+        return present_scroll_fallback(session, rgba, width, height);
     }
     if (dx == 0 && dy == 0) {
         return kittyfb_present_damage(session, rgba, width, height,
@@ -2436,8 +2444,12 @@ bool kittyfb_present_scroll(
 
     /* A shift with no overlapping interior is simply a new frame.  Compare
      * in int64_t so INT_MIN cannot overflow while being negated. */
-    if ((int64_t)dx <= -(int64_t)width || (int64_t)dx >= (int64_t)width ||
-        (int64_t)dy <= -(int64_t)height || (int64_t)dy >= (int64_t)height ||
+    region_width = region.x1 - region.x0;
+    region_height = region.y1 - region.y0;
+    if ((int64_t)dx <= -(int64_t)region_width ||
+        (int64_t)dx >= (int64_t)region_width ||
+        (int64_t)dy <= -(int64_t)region_height ||
+        (int64_t)dy >= (int64_t)region_height ||
         !kilix_scroll_compose_available()) {
         return present_scroll_fallback(session, rgba, width, height);
     }
@@ -2445,16 +2457,18 @@ bool kittyfb_present_scroll(
     /* The exposed strips are mandatory.  The caller only describes changes
      * that are not explained by the shift, such as fixed chrome. */
     if (dx > 0) {
-        requested[requested_count++] = (kittyfb_rect){0, 0, dx, height};
+        requested[requested_count++] = (kittyfb_rect){
+            region.x0, region.y0, region.x0 + dx, region.y1};
     } else if (dx < 0) {
-        requested[requested_count++] =
-            (kittyfb_rect){width + dx, 0, width, height};
+        requested[requested_count++] = (kittyfb_rect){
+            region.x1 + dx, region.y0, region.x1, region.y1};
     }
     if (dy > 0) {
-        requested[requested_count++] = (kittyfb_rect){0, 0, width, dy};
+        requested[requested_count++] = (kittyfb_rect){
+            region.x0, region.y0, region.x1, region.y0 + dy};
     } else if (dy < 0) {
-        requested[requested_count++] =
-            (kittyfb_rect){0, height + dy, width, height};
+        requested[requested_count++] = (kittyfb_rect){
+            region.x0, region.y1 + dy, region.x1, region.y1};
     }
     if (extra_rect_count > KITTYFB_DAMAGE_MAX_RECTS ||
         requested_count + extra_rect_count >
@@ -2477,12 +2491,12 @@ bool kittyfb_present_scroll(
          KITTYFB_DAMAGE_FRACTION_NUMERATOR) /
             KITTYFB_DAMAGE_FRACTION_DENOMINATOR;
 
-    src_x = dx < 0 ? -dx : 0;
-    src_y = dy < 0 ? -dy : 0;
-    dest_x = dx > 0 ? dx : 0;
-    dest_y = dy > 0 ? dy : 0;
-    copy_width = width - (dx < 0 ? -dx : dx);
-    copy_height = height - (dy < 0 ? -dy : dy);
+    src_x = region.x0 + (dx < 0 ? -dx : 0);
+    src_y = region.y0 + (dy < 0 ? -dy : 0);
+    dest_x = region.x0 + (dx > 0 ? dx : 0);
+    dest_y = region.y0 + (dy > 0 ? dy : 0);
+    copy_width = region_width - (dx < 0 ? -dx : dx);
+    copy_height = region_height - (dy < 0 ? -dy : dy);
 
     pthread_mutex_lock(&encode_lock);
     pthread_mutex_lock(&session->output_lock);
@@ -2551,4 +2565,21 @@ bool kittyfb_present_scroll(
     pthread_mutex_unlock(&session->frame_lock);
     pthread_mutex_unlock(&encode_lock);
     return ok;
+}
+
+bool kittyfb_present_scroll(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    int dx,
+    int dy,
+    const kittyfb_rect *extra_rects,
+    size_t extra_rect_count)
+{
+    const kittyfb_rect full_frame = {0, 0, width, height};
+
+    return kittyfb_present_scroll_region(
+        session, rgba, width, height, &full_frame, dx, dy,
+        extra_rects, extra_rect_count);
 }
