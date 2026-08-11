@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 — Unreleased
+
+- Add `kittyfb_present_scroll()` for retained-image shifts. Kilix terminals use
+  overlapping same-frame replacement composition and patch the exposed strips;
+  standard terminals and unsafe or uneconomical states retain the full-frame
+  fallback.
+- Permit inline `a=f` damage patches after a full image was delivered through
+  shared memory, retaining the cheapest transport for both update sizes.
+- Add scroll presentation, fallback, byte, mixed-transport, and wire-protocol
+  coverage.
+
 ## 0.4.0 — Unreleased
 
 - Add `kittyfb_present_damage()`, `kittyfb_rect`, and damage statistics for

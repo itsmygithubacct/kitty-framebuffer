@@ -76,12 +76,13 @@ damaged area whether patching is even the cheaper option.
 
 It falls back to a full present automatically when nothing has been presented
 yet, when a full frame is pending or in flight, when a resize clear is pending,
-when the displayed image has different dimensions, when the shared-memory
-transport is active (which has no per-rect form), or when the damage is too
-large or scattered for patches to pay. Overlapping and adjacent rectangles are
-coalesced when their bounding rectangle sends no extra pixels. That fallback is
-the point: a caller can use the function unconditionally instead of reasoning
-about when it helps.
+when the displayed image has different dimensions, or when the damage is too
+large or scattered for patches to pay. A frame initially delivered through
+shared memory can still receive inline frame edits, so local sessions retain
+the cheap full-frame transport without giving up small updates. Overlapping and
+adjacent rectangles are coalesced when their bounding rectangle sends no extra
+pixels. That fallback is the point: a caller can use the function
+unconditionally instead of reasoning about when it helps.
 
 **It is synchronous, unlike `kittyfb_present()`.** The presenter thread keeps
 only the newest pending frame and drops the rest — correct for video, where a
@@ -90,6 +91,29 @@ carries only its own rectangles and a dropped one leaves that region wrong until
 something else redraws it. Damage and full-frame writes share one serializer, so
 the final on-screen result follows API call order and their protocol bytes cannot
 interleave.
+
+## Scroll composition
+
+`kittyfb_present_scroll()` handles a common retained-image update without
+retransmitting pixels that merely moved. The caller supplies the complete new
+frame and the `(dx, dy)` shift from the previous frame. The library asks the
+Kilix Kitty fork to compose the overlapping interior in place with `a=c,C=1,N=2`
+and patches the newly exposed edge strips from the new frame. Extra damage
+rectangles can cover fixed chrome or any change not explained by the shift.
+
+```c
+kittyfb_rect toolbar = {0, 0, width, toolbar_height};
+kittyfb_present_scroll(&session, rgba, width, height,
+                       0, -scroll_pixels, &toolbar, 1);
+```
+
+The `KITTY_KILIX_RENDERING=1` marker is the capability negotiation for the
+fork extension. Without it, before an initial frame, across a resize or queued
+frame, for a large shift, or when patches stop being economical, the operation
+falls back to a normal full presentation. On the fork, the terminal performs
+the compose on a hardware GPU when available and uses its existing CPU upload
+path otherwise; either route has the same snapshot/memmove result. Compose and
+patch packets are synchronous and share the full-frame serializer.
 
 ## Build and test
 
@@ -246,7 +270,7 @@ not extend the configured timeout indefinitely.
 ## Diagnostics
 
 `kittyfb_get_stats()` snapshots frames presented, encoded, and dropped; encode
-failures; and damage presents, fallbacks, and bytes. When compression,
+failures; and damage/scroll presents, fallbacks, and bytes. When compression,
 allocation, or the terminal write fails, the failure latches:
 `kittyfb_present()` returns false from then on and `kittyfb_failed()` reports it,
 so the application can exit its render loop instead of animating into a void.

@@ -27,7 +27,7 @@ extern "C" {
 #endif
 
 #define KITTYFB_VERSION_MAJOR 0
-#define KITTYFB_VERSION_MINOR 4
+#define KITTYFB_VERSION_MINOR 5
 #define KITTYFB_VERSION_PATCH 0
 #define KITTYFB_CONTROL_SEQUENCE_MAX 64
 
@@ -143,6 +143,9 @@ typedef struct kittyfb_stats {
     uint64_t damage_presents;   /* kittyfb_present_damage() calls patched */
     uint64_t damage_fallbacks;  /* ...and calls that fell back to a full frame */
     uint64_t damage_bytes;      /* escape-stream bytes written by patches */
+    uint64_t scroll_presents;   /* scroll-composed frames plus exposed patches */
+    uint64_t scroll_fallbacks;  /* scroll calls retransmitted as full frames */
+    uint64_t scroll_bytes;      /* compose and patch escape-stream bytes */
 } kittyfb_stats;
 
 /* Public so callers can allocate it without malloc; fields are internal. */
@@ -323,7 +326,6 @@ typedef struct kittyfb_rect {
  *   - the damaged area exceeds a fraction of the frame where patching
  *     stops paying (many small rects cost more in per-rect overhead than
  *     one clean frame);
- *   - the active transport cannot express an edit.
  *
  * That fallback is why a caller can use this unconditionally and does
  * not have to reason about when it helps.  Cost-free overlapping or
@@ -345,6 +347,29 @@ bool kittyfb_present_damage(
     int height,
     const kittyfb_rect *rects,
     size_t rect_count);
+
+/*
+ * Present a frame whose retained pixels are the previous frame shifted by
+ * (dx, dy).  Pixels moving right/down use positive values.  The newly exposed
+ * edge strips are patched automatically from rgba; extra_rects names any
+ * other pixels that changed (for example a fixed toolbar).
+ *
+ * On the Kilix Kitty fork this uses overlapping same-frame replacement
+ * composition (a=c,C=1,N=2), followed by inline a=f patches in one synchronized
+ * update.  The terminal may execute the compose on its GPU or its existing CPU
+ * path.  Other terminals, invalid/large shifts, missing displayed state,
+ * queued frames, and uneconomical damage transparently fall back to
+ * kittyfb_present().  A zero shift is equivalent to present_damage().
+ */
+bool kittyfb_present_scroll(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    int dx,
+    int dy,
+    const kittyfb_rect *extra_rects,
+    size_t extra_rect_count);
 
 /*
  * Re-read the terminal size and re-derive the framebuffer geometry.

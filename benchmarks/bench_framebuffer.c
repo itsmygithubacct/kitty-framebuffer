@@ -345,6 +345,29 @@ static bool benchmark_presenter(void)
         (void)printf("damage_8_adjacent_64x64_ms %.3f\n",
                      (double)elapsed / 1.0e6 / repetitions);
     }
+    {
+        const kittyfb_rect toolbar = {0, 0, WIDTH, 32};
+        const int repetitions = 100;
+
+        if (setenv("KITTY_KILIX_RENDERING", "1", 1) != 0) {
+            goto stop_reader;
+        }
+        start = monotonic_ns();
+        for (int run = 0; run < repetitions; ++run) {
+            int dy = (run & 1) == 0 ? -24 : 24;
+
+            if (!kittyfb_present_scroll(
+                    &session, frame, WIDTH, HEIGHT, 0, dy, &toolbar, 1u)) {
+                goto stop_reader;
+            }
+        }
+        elapsed = monotonic_ns() - start;
+        (void)printf("scroll_24px_toolbar_ms %.3f\n",
+                     (double)elapsed / 1.0e6 / repetitions);
+        if (unsetenv("KITTY_KILIX_RENDERING") != 0) {
+            goto stop_reader;
+        }
+    }
     ok = true;
 
 stop_reader:
@@ -362,7 +385,8 @@ done:
 
 int main(void)
 {
-    if (unsetenv("KITTYFB_TRANSPORT") != 0) {
+    if (unsetenv("KITTYFB_TRANSPORT") != 0 ||
+        unsetenv("KITTY_KILIX_RENDERING") != 0) {
         (void)perror("unsetenv");
         return 1;
     }

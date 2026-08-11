@@ -2062,6 +2062,58 @@ static bool merge_damage_rects(
     return true;
 }
 
+static size_t collect_damage_rects(
+    const kittyfb_rect *rects,
+    size_t rect_count,
+    int width,
+    int height,
+    kittyfb_rect *clamped,
+    bool *too_many_rects,
+    size_t *damaged_pixels)
+{
+    size_t usable = 0u;
+    const size_t total_pixels = (size_t)width * (size_t)height;
+
+    *too_many_rects = rect_count > KITTYFB_DAMAGE_MAX_RECTS;
+    *damaged_pixels = 0u;
+    for (size_t i = 0u; i < rect_count && !*too_many_rects; i++) {
+        kittyfb_rect fixed;
+
+        if (!damage_rect_valid(&rects[i], width, height, &fixed)) {
+            continue;
+        }
+        for (;;) {
+            bool merged = false;
+
+            for (size_t prior = 0u; prior < usable; ++prior) {
+                kittyfb_rect combined;
+
+                if (merge_damage_rects(&fixed, &clamped[prior], &combined)) {
+                    fixed = combined;
+                    clamped[prior] = clamped[--usable];
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) {
+                break;
+            }
+        }
+        clamped[usable++] = fixed;
+    }
+    for (size_t i = 0u; i < usable; ++i) {
+        const size_t area = damage_rect_area(&clamped[i]);
+
+        /* Rectangles whose bounding box was not cheap enough to merge can
+         * still overlap. Count conservatively and saturate instead of
+         * wrapping into a patch-fast path. */
+        *damaged_pixels = area >= total_pixels - *damaged_pixels
+                              ? total_pixels
+                              : *damaged_pixels + area;
+    }
+    return usable;
+}
+
 /* One a=f packet for one rectangle: RGB, zlib, base64, chunked. */
 static bool write_damage_rect(
     kittyfb_session *session,
@@ -2228,45 +2280,8 @@ bool kittyfb_present_damage(
         ((total_pixels % KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
          KITTYFB_DAMAGE_FRACTION_NUMERATOR) /
             KITTYFB_DAMAGE_FRACTION_DENOMINATOR;
-    too_many_rects = rect_count > KITTYFB_DAMAGE_MAX_RECTS;
-
-    for (size_t i = 0u; i < rect_count && !too_many_rects; i++) {
-        kittyfb_rect fixed;
-
-        if (!damage_rect_valid(&rects[i], width, height, &fixed)) {
-            continue;
-        }
-        for (;;) {
-            bool merged = false;
-
-            for (size_t prior = 0u; prior < usable; ++prior) {
-                kittyfb_rect combined;
-
-                if (merge_damage_rects(
-                        &fixed, &clamped[prior], &combined)) {
-                    fixed = combined;
-                    clamped[prior] = clamped[--usable];
-                    merged = true;
-                    break;
-                }
-            }
-            if (!merged) {
-                break;
-            }
-        }
-        clamped[usable++] = fixed;
-    }
-    for (size_t i = 0u; i < usable; ++i) {
-        size_t area = damage_rect_area(&clamped[i]);
-
-        /* The merge pass removes cost-free overlap/adjacency.  Rectangles
-         * whose bounding box would add too many unchanged pixels can still
-         * overlap, so count them conservatively and saturate at a full frame
-         * rather than wrapping into the patch-fast path. */
-        damaged_pixels = area >= total_pixels - damaged_pixels
-                             ? total_pixels
-                             : damaged_pixels + area;
-    }
+    usable = collect_damage_rects(rects, rect_count, width, height, clamped,
+                                  &too_many_rects, &damaged_pixels);
     if (usable == 0u && !too_many_rects) {
         return true;
     }
@@ -2305,8 +2320,6 @@ bool kittyfb_present_damage(
      *     and the screen would stay wrong until something else changed.
      *     Replacing that frame instead is the same newest-wins bargain
      *     the pending slot already makes;
-     *   - the shared-memory transport hands the terminal a whole buffer
-     *     and has no per-rect form;
      *   - too much changed, where per-rect overhead and many small zlib
      *     streams cost more than one clean frame.
      *
@@ -2316,7 +2329,7 @@ bool kittyfb_present_damage(
     fallback = nothing_on_screen || image_id == 0 ||
                session->frame_pending || session->clear_pending ||
                displayed_session != session || displayed_width != width ||
-               displayed_height != height || session->shm_active ||
+               displayed_height != height ||
                damaged_pixels > damage_limit || too_many_rects ||
                usable >= KITTYFB_DAMAGE_MAX_RECTS;
     if (fallback) {
@@ -2346,6 +2359,187 @@ bool kittyfb_present_damage(
         /* Include the DEC synchronized-update begin/end around the graphics
          * packets: this counter describes all bytes emitted by the patch. */
         session->stats.damage_bytes += bytes + 16u;
+    } else if (!__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&session->presenter_disabled,
+                                __ATOMIC_ACQUIRE)) {
+        session->stats.encode_failures++;
+        session->presenter_failed = true;
+        session->presenter_running = false;
+        pthread_cond_broadcast(&session->frame_cond);
+    }
+    pthread_mutex_unlock(&session->frame_lock);
+    pthread_mutex_unlock(&encode_lock);
+    return ok;
+}
+
+static bool kilix_scroll_compose_available(void)
+{
+    const char *value = getenv("KITTY_KILIX_RENDERING");
+
+    return value != NULL && strcmp(value, "1") == 0;
+}
+
+static bool present_scroll_fallback(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height)
+{
+    pthread_mutex_lock(&session->frame_lock);
+    session->stats.scroll_fallbacks++;
+    pthread_mutex_unlock(&session->frame_lock);
+    return kittyfb_present(session, rgba, width, height);
+}
+
+bool kittyfb_present_scroll(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    int dx,
+    int dy,
+    const kittyfb_rect *extra_rects,
+    size_t extra_rect_count)
+{
+    kittyfb_rect requested[KITTYFB_DAMAGE_MAX_RECTS + 2u];
+    kittyfb_rect clamped[KITTYFB_DAMAGE_MAX_RECTS];
+    size_t requested_count = 0u;
+    size_t usable = 0u;
+    size_t damaged_pixels = 0u;
+    size_t rgba_length;
+    size_t total_pixels;
+    size_t damage_limit;
+    size_t bytes = 0u;
+    bool too_many_rects = false;
+    bool fallback;
+    bool began_update = false;
+    bool ok = true;
+    int image_id;
+    int src_x;
+    int src_y;
+    int dest_x;
+    int dest_y;
+    int copy_width;
+    int copy_height;
+    char compose[224];
+    int compose_length;
+
+    if (session == NULL || !session->active || rgba == NULL ||
+        !frame_byte_count(width, height, &rgba_length) ||
+        (extra_rect_count > 0u && extra_rects == NULL)) {
+        return false;
+    }
+    if (dx == 0 && dy == 0) {
+        return kittyfb_present_damage(session, rgba, width, height,
+                                      extra_rects, extra_rect_count);
+    }
+
+    /* A shift with no overlapping interior is simply a new frame.  Compare
+     * in int64_t so INT_MIN cannot overflow while being negated. */
+    if ((int64_t)dx <= -(int64_t)width || (int64_t)dx >= (int64_t)width ||
+        (int64_t)dy <= -(int64_t)height || (int64_t)dy >= (int64_t)height ||
+        !kilix_scroll_compose_available()) {
+        return present_scroll_fallback(session, rgba, width, height);
+    }
+
+    /* The exposed strips are mandatory.  The caller only describes changes
+     * that are not explained by the shift, such as fixed chrome. */
+    if (dx > 0) {
+        requested[requested_count++] = (kittyfb_rect){0, 0, dx, height};
+    } else if (dx < 0) {
+        requested[requested_count++] =
+            (kittyfb_rect){width + dx, 0, width, height};
+    }
+    if (dy > 0) {
+        requested[requested_count++] = (kittyfb_rect){0, 0, width, dy};
+    } else if (dy < 0) {
+        requested[requested_count++] =
+            (kittyfb_rect){0, height + dy, width, height};
+    }
+    if (extra_rect_count > KITTYFB_DAMAGE_MAX_RECTS ||
+        requested_count + extra_rect_count >
+            KITTYFB_DAMAGE_MAX_RECTS + 2u) {
+        too_many_rects = true;
+    } else {
+        for (size_t i = 0u; i < extra_rect_count; i++) {
+            requested[requested_count++] = extra_rects[i];
+        }
+        usable = collect_damage_rects(
+            requested, requested_count, width, height, clamped,
+            &too_many_rects, &damaged_pixels);
+    }
+
+    total_pixels = rgba_length / 4u;
+    damage_limit =
+        (total_pixels / KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
+            KITTYFB_DAMAGE_FRACTION_NUMERATOR +
+        ((total_pixels % KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
+         KITTYFB_DAMAGE_FRACTION_NUMERATOR) /
+            KITTYFB_DAMAGE_FRACTION_DENOMINATOR;
+
+    src_x = dx < 0 ? -dx : 0;
+    src_y = dy < 0 ? -dy : 0;
+    dest_x = dx > 0 ? dx : 0;
+    dest_y = dy > 0 ? dy : 0;
+    copy_width = width - (dx < 0 ? -dx : dx);
+    copy_height = height - (dy < 0 ? -dy : dy);
+
+    pthread_mutex_lock(&encode_lock);
+    pthread_mutex_lock(&session->output_lock);
+    pthread_mutex_lock(&session->frame_lock);
+    if (!session->active || session->presenter_failed ||
+        (session->presenter_started && !session->presenter_running)) {
+        pthread_mutex_unlock(&session->frame_lock);
+        pthread_mutex_unlock(&session->output_lock);
+        pthread_mutex_unlock(&encode_lock);
+        return false;
+    }
+    image_id = session->shown_image_id;
+    fallback = session->stats.frames_encoded == 0u || image_id == 0 ||
+               session->frame_pending || session->clear_pending ||
+               displayed_session != session || displayed_width != width ||
+               displayed_height != height || damaged_pixels > damage_limit ||
+               too_many_rects || usable == 0u ||
+               usable >= KITTYFB_DAMAGE_MAX_RECTS;
+    if (fallback) {
+        session->stats.scroll_fallbacks++;
+        pthread_mutex_unlock(&session->frame_lock);
+        pthread_mutex_unlock(&session->output_lock);
+        pthread_mutex_unlock(&encode_lock);
+        return kittyfb_present(session, rgba, width, height);
+    }
+    pthread_mutex_unlock(&session->frame_lock);
+
+    compose_length = snprintf(
+        compose, sizeof(compose),
+        "\x1b_Ga=c,i=%d,r=1,c=1,x=%d,y=%d,X=%d,Y=%d,w=%d,h=%d,C=1,N=2,q=2;\x1b\\",
+        image_id, dest_x, dest_y, src_x, src_y, copy_width, copy_height);
+    if (compose_length < 0 || (size_t)compose_length >= sizeof(compose)) {
+        ok = false;
+    }
+    if (ok) {
+        ok = write_all(session, "\x1b[?2026h", 8u);
+        began_update = ok;
+    }
+    if (ok) {
+        ok = write_all(session, compose, (size_t)compose_length);
+        if (ok) {
+            bytes += (size_t)compose_length;
+        }
+    }
+    for (size_t i = 0u; i < usable && ok; i++) {
+        ok = write_damage_rect(session, rgba, width, &clamped[i], image_id,
+                               &bytes);
+    }
+    if (began_update && !write_all(session, "\x1b[?2026l", 8u)) {
+        ok = false;
+    }
+    pthread_mutex_unlock(&session->output_lock);
+
+    pthread_mutex_lock(&session->frame_lock);
+    if (ok) {
+        session->stats.scroll_presents++;
+        session->stats.scroll_bytes += bytes + 16u;
     } else if (!__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) &&
                !__atomic_load_n(&session->presenter_disabled,
                                 __ATOMIC_ACQUIRE)) {

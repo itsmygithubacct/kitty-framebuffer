@@ -584,7 +584,7 @@ test_options_defaults(void)
 
     kittyfb_options_init(&options);
     CHECK(KITTYFB_VERSION_MAJOR == 0);
-    CHECK(KITTYFB_VERSION_MINOR == 4);
+    CHECK(KITTYFB_VERSION_MINOR == 5);
     CHECK(KITTYFB_VERSION_PATCH == 0);
     CHECK(options.manage_raw_mode);
     CHECK(options.manage_alt_screen);
@@ -1836,6 +1836,132 @@ test_pty_damage_multichunk_protocol(void)
     return true;
 }
 
+static bool
+test_pty_shm_frame_accepts_inline_damage(void)
+{
+    enum { FRAME_W = 64, FRAME_H = 48 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[262144];
+    char shm_name[128];
+    size_t used = 0u;
+    kittyfb_rect rect = {8, 4, 20, 12};
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_SHM;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    if (kittyfb_active_transport(&session) != KITTYFB_TRANSPORT_SHM) {
+        (void)fprintf(stderr,
+                      "  SKIPPED: shared memory unavailable in this "
+                      "environment\n");
+        kittyfb_stop(&session);
+        (void)close(master);
+        (void)close(slave);
+        return true;
+    }
+    drain_descriptor(master);
+
+    CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
+                              buffer, sizeof(buffer), &used));
+    CHECK(wire_has(buffer, used, "t=s"));
+    CHECK(extract_shm_name(buffer, used, shm_name, sizeof(shm_name)));
+    CHECK(consume_shm_frame(shm_name, frame, FRAME_W, FRAME_H));
+
+    fill_test_frame(frame, FRAME_W, FRAME_H, 2u);
+    CHECK(kittyfb_present_damage(
+        &session, frame, FRAME_W, FRAME_H, &rect, 1u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=f"));
+    CHECK(!wire_has(buffer, used, "a=T"));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_presents == 1u);
+    CHECK(stats.damage_fallbacks == 0u);
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
+static bool
+test_pty_scroll_compose_and_fallback(void)
+{
+    enum { FRAME_W = 64, FRAME_H = 48 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[262144];
+    size_t used = 0u;
+    kittyfb_rect toolbar = {0, 0, FRAME_W, 2};
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+    CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
+                              buffer, sizeof(buffer), &used));
+
+    CHECK(setenv("KITTY_KILIX_RENDERING", "1", 1) == 0);
+    fill_test_frame(frame, FRAME_W, FRAME_H, 2u);
+    CHECK(kittyfb_present_scroll(
+        &session, frame, FRAME_W, FRAME_H, 0, -4, &toolbar, 1u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=c,i=1,r=1,c=1"));
+    CHECK(wire_has(buffer, used, "x=0,y=0,X=0,Y=4,w=64,h=44"));
+    CHECK(wire_has(buffer, used, "C=1,N=2,q=2"));
+    CHECK(wire_has(buffer, used, "a=f"));
+    CHECK(wire_has(buffer, used, "x=0,y=44,s=64,v=4"));
+    CHECK(wire_has(buffer, used, "x=0,y=0,s=64,v=2"));
+    CHECK(!wire_has(buffer, used, "a=T"));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.scroll_presents == 1u);
+    CHECK(stats.scroll_fallbacks == 0u);
+    CHECK(stats.scroll_bytes > 0u);
+
+    /* The environment marker is capability negotiation.  Without it a
+     * standard Kitty-compatible terminal receives a complete frame and can
+     * never be left with a rejected fork-only compose command. */
+    CHECK(unsetenv("KITTY_KILIX_RENDERING") == 0);
+    fill_test_frame(frame, FRAME_W, FRAME_H, 3u);
+    CHECK(kittyfb_present_scroll(
+        &session, frame, FRAME_W, FRAME_H, 0, -4, NULL, 0u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=T"));
+    CHECK(!wire_has(buffer, used, "a=c"));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.scroll_presents == 1u);
+    CHECK(stats.scroll_fallbacks == 1u);
+
+    CHECK(!kittyfb_present_scroll(
+        &session, NULL, FRAME_W, FRAME_H, 0, -4, NULL, 0u));
+    CHECK(!kittyfb_present_scroll(
+        &session, frame, FRAME_W, FRAME_H, 0, -4, NULL, 1u));
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
 /* Falling back rather than refusing is what lets a caller use this
  * unconditionally instead of reasoning about when it pays. */
 static bool
@@ -2440,6 +2566,10 @@ main(void)
         {"PTY damage patches in place", test_pty_damage_patches_in_place},
         {"PTY damage multichunk protocol",
          test_pty_damage_multichunk_protocol},
+        {"PTY shm frame accepts inline damage",
+         test_pty_shm_frame_accepts_inline_damage},
+        {"PTY scroll compose and fallback",
+         test_pty_scroll_compose_and_fallback},
         {"PTY damage falls back", test_pty_damage_falls_back},
         {"PTY damage rect handling", test_pty_damage_rect_handling},
         {"PTY damage serializes with presenter",
@@ -2457,7 +2587,8 @@ main(void)
     /* The public overrides are useful interactively but must not silently
      * select different transports or bypass probes in a test process. */
     if (unsetenv("KITTYFB_TRANSPORT") != 0 ||
-        unsetenv("KITTYFB_SKIP_PROBE") != 0 || unsetenv("TMUX") != 0) {
+        unsetenv("KITTYFB_SKIP_PROBE") != 0 ||
+        unsetenv("KITTY_KILIX_RENDERING") != 0 || unsetenv("TMUX") != 0) {
         (void)perror("unsetenv");
         return 1;
     }
