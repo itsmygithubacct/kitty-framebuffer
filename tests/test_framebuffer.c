@@ -1838,6 +1838,168 @@ test_pty_damage_multichunk_protocol(void)
     return true;
 }
 
+/*
+ * Consume one complete single-chunk a=f patch packet at *offset: the exact
+ * header for this rectangle, a base64 payload that decodes to the rect's
+ * pixels, and the APC terminator.  Advances *offset past the packet, so a
+ * caller walking a burst pins byte-level contiguity, not just presence.
+ */
+static bool
+expect_patch_packet(
+    const char *buffer,
+    size_t used,
+    size_t *offset,
+    int image_id,
+    const kittyfb_rect *rect,
+    const uint8_t *rgba,
+    int width)
+{
+    static uint8_t compressed[65536];
+    static uint8_t raw[65536];
+    char header[128];
+    int printed;
+    size_t payload_size;
+    size_t compressed_length;
+    uLongf raw_length;
+    const int rect_width = rect->x1 - rect->x0;
+    const int rect_height = rect->y1 - rect->y0;
+
+    printed = snprintf(
+        header, sizeof(header),
+        "\x1b_Ga=f,i=%d,r=1,X=1,q=2,f=24,o=z,x=%d,y=%d,s=%d,v=%d,m=0;",
+        image_id, rect->x0, rect->y0, rect_width, rect_height);
+    CHECK(printed > 0 && (size_t)printed < sizeof(header));
+    CHECK(*offset + (size_t)printed <= used);
+    CHECK(memcmp(buffer + *offset, header, (size_t)printed) == 0);
+    *offset += (size_t)printed;
+
+    payload_size = find_bytes(buffer + *offset, used - *offset, "\x1b\\", 2u);
+    CHECK(payload_size != SIZE_MAX && payload_size > 0u);
+    compressed_length = base64_decode(buffer + *offset, payload_size,
+                                      compressed);
+    CHECK(compressed_length > 0u);
+    raw_length = (uLongf)sizeof(raw);
+    CHECK(uncompress(raw, &raw_length, compressed,
+                     (uLong)compressed_length) == Z_OK);
+    CHECK((size_t)raw_length ==
+          (size_t)rect_width * (size_t)rect_height * 3u);
+    for (int y = 0; y < rect_height; ++y) {
+        for (int x = 0; x < rect_width; ++x) {
+            const uint8_t *expected = rgba +
+                (((size_t)(rect->y0 + y) * (size_t)width +
+                  (size_t)(rect->x0 + x)) * 4u);
+            const uint8_t *got = raw +
+                ((size_t)y * (size_t)rect_width + (size_t)x) * 3u;
+
+            CHECK(got[0] == expected[0]);
+            CHECK(got[1] == expected[1]);
+            CHECK(got[2] == expected[2]);
+        }
+    }
+    *offset += payload_size + 2u;
+    return true;
+}
+
+/*
+ * Pin the complete escape stream of multi-rect damage and scroll bursts,
+ * packet by packet in submission order with nothing in between: begin
+ * update, per-rect patches (compose first for a scroll), end update, and
+ * the byte counters describing exactly what was captured.  Any change to
+ * how the burst is assembled or written must reproduce this stream
+ * byte for byte.
+ */
+static bool
+test_pty_patch_burst_wire_sequence(void)
+{
+    enum { FRAME_W = 64, FRAME_H = 48 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[262144];
+    char compose[224];
+    int compose_length;
+    size_t used = 0u;
+    size_t offset;
+    const kittyfb_rect scattered[3] = {
+        {2, 2, 10, 8}, {30, 20, 40, 28}, {50, 40, 60, 46}
+    };
+    const kittyfb_rect viewport = {0, 2, FRAME_W, FRAME_H};
+    const kittyfb_rect toolbar = {0, 0, FRAME_W, 2};
+    const kittyfb_rect exposed = {0, 44, FRAME_W, FRAME_H};
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+    CHECK(present_and_capture(&session, master, frame, FRAME_W, FRAME_H, 1u,
+                              buffer, sizeof(buffer), &used));
+    CHECK(wait_for_encoded_frames(&session, 1u));
+    drain_descriptor(master);
+
+    /* Three rects too far apart to coalesce: the burst must carry each in
+     * the order given, wrapped in one synchronized update. */
+    fill_test_frame(frame, FRAME_W, FRAME_H, 2u);
+    CHECK(kittyfb_present_damage(
+        &session, frame, FRAME_W, FRAME_H, scattered, 3u));
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+
+    CHECK(starts_with(buffer, used, "\x1b[?2026h"));
+    offset = 8u;
+    for (size_t i = 0u; i < 3u; ++i) {
+        CHECK(expect_patch_packet(buffer, used, &offset, 1, &scattered[i],
+                                  frame, FRAME_W));
+    }
+    CHECK(used == offset + 8u);
+    CHECK(ends_with(buffer, used, "\x1b[?2026l"));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_presents == 1u);
+    CHECK(stats.damage_bytes == (uint64_t)used);
+
+    /* A scroll burst is the same stream with the compose packet leading:
+     * begin, compose, exposed strip, extra rects, end. */
+    CHECK(setenv("KITTY_KILIX_RENDERING", "1", 1) == 0);
+    fill_test_frame(frame, FRAME_W, FRAME_H, 3u);
+    CHECK(kittyfb_present_scroll_region(
+        &session, frame, FRAME_W, FRAME_H, &viewport, 0, -4, &toolbar, 1u));
+    CHECK(unsetenv("KITTY_KILIX_RENDERING") == 0);
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+
+    compose_length = snprintf(
+        compose, sizeof(compose),
+        "\x1b_Ga=c,i=%d,r=1,c=1,x=%d,y=%d,X=%d,Y=%d,w=%d,h=%d,C=1,N=2,q=2;\x1b\\",
+        1, 0, 2, 0, 6, FRAME_W, 42);
+    CHECK(compose_length > 0 && (size_t)compose_length < sizeof(compose));
+    CHECK(starts_with(buffer, used, "\x1b[?2026h"));
+    offset = 8u;
+    CHECK(offset + (size_t)compose_length <= used);
+    CHECK(memcmp(buffer + offset, compose, (size_t)compose_length) == 0);
+    offset += (size_t)compose_length;
+    CHECK(expect_patch_packet(buffer, used, &offset, 1, &exposed,
+                              frame, FRAME_W));
+    CHECK(expect_patch_packet(buffer, used, &offset, 1, &toolbar,
+                              frame, FRAME_W));
+    CHECK(used == offset + 8u);
+    CHECK(ends_with(buffer, used, "\x1b[?2026l"));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.scroll_presents == 1u);
+    CHECK(stats.scroll_bytes == (uint64_t)used);
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
 static bool
 test_pty_shm_frame_accepts_inline_damage(void)
 {
@@ -2584,6 +2746,8 @@ main(void)
         {"PTY damage patches in place", test_pty_damage_patches_in_place},
         {"PTY damage multichunk protocol",
          test_pty_damage_multichunk_protocol},
+        {"PTY patch burst wire sequence",
+         test_pty_patch_burst_wire_sequence},
         {"PTY shm frame accepts inline damage",
          test_pty_shm_frame_accepts_inline_damage},
         {"PTY scroll compose and fallback",
