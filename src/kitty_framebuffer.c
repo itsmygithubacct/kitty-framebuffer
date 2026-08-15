@@ -726,8 +726,13 @@ static void shm_slot_release(struct kittyfb_shm_slot *slot)
 
 /*
  * Free every slot the terminal has consumed.  Kitty unlinks a t=s object
- * as soon as it has read it, so a name that no longer resolves is an
- * acknowledgement.  Returns the number of free slots.
+ * as soon as it has read it, and the slot's own fd - held open for the
+ * whole busy period - observes that as its link count dropping to zero.
+ * One lookup-free fstat per slot replaces a shm_open/close pathname
+ * probe, and unlike the name probe it cannot be confused by a recycled
+ * name resolving to a newer object.  Linux link-count semantics for
+ * shared memory are already relied on by kittyfb_reap_orphans().
+ * Returns the number of free slots.
  */
 static int shm_ring_reap(kittyfb_session *session)
 {
@@ -735,21 +740,19 @@ static int shm_ring_reap(kittyfb_session *session)
 
     for (int index = 0; index < session->shm_slot_count; index++) {
         struct kittyfb_shm_slot *slot = &session->shm_slots[index];
+        struct stat state;
+
         if (!slot->busy) {
             free_count++;
             continue;
         }
-        int probe = shm_open(slot->name, O_RDONLY, 0);
-        if (probe >= 0) {
-            (void)close(probe);
-            continue;   /* still unread */
-        }
-        if (errno == ENOENT) {
+        if (fstat(slot->fd, &state) == 0 && state.st_nlink == 0) {
             shm_slot_release(slot);
             free_count++;
         }
-        /* Any other errno leaves the slot busy: it will be retried on the
-         * next frame, and the ring degrades to fewer slots rather than
+        /* A surviving link means the object is still unread.  An fstat
+         * error leaves the slot busy: it will be retried on the next
+         * frame, and the ring degrades to fewer slots rather than
          * handing the terminal an object it may still be reading. */
     }
     return free_count;

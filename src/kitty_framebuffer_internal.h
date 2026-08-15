@@ -28,12 +28,13 @@ extern "C" {
 /*
  * One shared-memory slot.  A slot is "busy" from the moment its object
  * is created until the terminal unlinks it, which is how consumption is
- * detected: shm_open() on a busy slot's name failing with ENOENT means
- * the terminal has read and released it.
+ * detected: the held fd's link count dropping to zero means the terminal
+ * has read and released the object.
  *
  * The fd and mapping are held for the whole busy period rather than
- * closed after writing, because the mapping keeps the unlinked object
- * alive until the terminal has finished with it.
+ * closed after writing, because they keep the unlinked object alive
+ * until the terminal has finished with it, and the fd is what the link
+ * count is read through.
  */
 struct kittyfb_shm_slot {
     char name[KITTYFB_SHM_NAME_MAX];
