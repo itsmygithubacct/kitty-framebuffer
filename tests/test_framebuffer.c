@@ -2465,7 +2465,7 @@ test_pty_shm_transport(void)
 
     kittyfb_suspend(&session);
     /* Suspension retains heap high-water buffers but releases every tmpfs
-     * mapping; a stopped job may remain suspended indefinitely. */
+     * object; a stopped job may remain suspended indefinitely. */
     CHECK(session.shm_slots == NULL);
     CHECK(session.shm_slot_count == 0);
     /* Teardown unlinks every slot, consumed or not: a slot left behind
@@ -2595,7 +2595,6 @@ test_pty_shm_publish_failure_rolls_back(void)
 
         CHECK(!session.shm_slots[index].busy);
         CHECK(session.shm_slots[index].fd == -1);
-        CHECK(session.shm_slots[index].mapping == NULL);
         fd = shm_open(session.shm_slots[index].name, O_RDONLY, 0);
         CHECK(fd < 0 && errno == ENOENT);
     }

@@ -31,15 +31,14 @@ extern "C" {
  * detected: the held fd's link count dropping to zero means the terminal
  * has read and released the object.
  *
- * The fd and mapping are held for the whole busy period rather than
- * closed after writing, because they keep the unlinked object alive
- * until the terminal has finished with it, and the fd is what the link
- * count is read through.
+ * The fd is held for the whole busy period rather than closed after
+ * writing, because it keeps the unlinked object alive until the terminal
+ * has finished with it, and it is what the link count is read through.
+ * The pixels are written through the fd; the producer never maps the
+ * object.
  */
 struct kittyfb_shm_slot {
     char name[KITTYFB_SHM_NAME_MAX];
-    void *mapping;
-    size_t mapping_size;
     int fd;
     bool busy;
 };

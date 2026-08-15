@@ -425,7 +425,7 @@ int kittyfb_reap_orphans(void);
 
 /*
  * Join the presenter and restore the terminal while retaining all
- * high-water heap frame and encoder buffers.  Shared-memory mappings are
+ * high-water heap frame and encoder buffers.  Shared-memory objects are
  * released rather than pinning tmpfs while the process is stopped.  Use
  * before process suspension, then call kittyfb_start() after continuation;
  * that start recreates the ring and re-resolves the transport.  A later

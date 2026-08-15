@@ -229,7 +229,7 @@ SIGWINCH can set `install_winch_handler = false` and optionally call
 `kittyfb_suspend()` joins the presenter and restores the terminal but retains
 the frame and encoder buffers at their high-water capacities. Call
 `kittyfb_start()` after continuation; repeated job-control cycles then reuse
-the large heap allocations. Shared-memory slots and their tmpfs mappings are
+the large heap allocations. Shared-memory slots and their tmpfs objects are
 released during suspension and recreated on the next start, which also
 re-resolves changed transport options and environment. A final `kittyfb_stop()`
 releases retained storage whether or not the session was restarted.

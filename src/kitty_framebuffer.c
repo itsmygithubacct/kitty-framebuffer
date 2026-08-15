@@ -712,15 +712,10 @@ static unsigned shm_session_serial;
 
 static void shm_slot_release(struct kittyfb_shm_slot *slot)
 {
-    if (slot->mapping != NULL) {
-        (void)munmap(slot->mapping, slot->mapping_size);
-        slot->mapping = NULL;
-    }
     if (slot->fd >= 0) {
         (void)close(slot->fd);
         slot->fd = -1;
     }
-    slot->mapping_size = 0;
     slot->busy = false;
 }
 
@@ -756,6 +751,32 @@ static int shm_ring_reap(kittyfb_session *session)
          * handing the terminal an object it may still be reading. */
     }
     return free_count;
+}
+
+/* Land the frame in the object with positioned writes.  On tmpfs a
+ * full-page write allocates and fills each page in one pass, where a
+ * memcpy into a fresh mapping first minor-faults the page in and zeroes
+ * it before overwriting it - and the mapping itself would cost an
+ * mmap/munmap pair per frame.  The held fd alone keeps the unlinked
+ * object alive for the terminal. */
+static bool shm_slot_store(int fd, const uint8_t *data, size_t size)
+{
+    size_t offset = 0u;
+
+    while (offset < size) {
+        ssize_t count = pwrite(fd, data + offset, size - offset,
+                               (off_t)offset);
+
+        if (count > 0) {
+            offset += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
 }
 
 /*
@@ -797,22 +818,13 @@ static struct kittyfb_shm_slot *shm_ring_publish(
     if (fd < 0) {
         return NULL;
     }
-    if (ftruncate(fd, (off_t)size) != 0) {
+    if (!shm_slot_store(fd, data, size)) {
         (void)close(fd);
         (void)shm_unlink(slot->name);
         return NULL;
     }
-    void *mapping = mmap(NULL, size, PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mapping == MAP_FAILED) {
-        (void)close(fd);
-        (void)shm_unlink(slot->name);
-        return NULL;
-    }
-    memcpy(mapping, data, size);
 
     slot->fd = fd;
-    slot->mapping = mapping;
-    slot->mapping_size = size;
     slot->busy = true;
     return slot;
 }
@@ -1420,7 +1432,7 @@ static void presenter_shutdown(
         session->packet_capacity = 0;
     }
     /* A suspended process may remain stopped indefinitely; do not pin unread
-     * multi-megabyte tmpfs mappings during that time.  Heap encoder buffers
+     * multi-megabyte tmpfs objects during that time.  Heap encoder buffers
      * retain the expensive high-water allocations, while start cheaply
      * resolves a fresh ring and honors any changed transport options. */
     shm_ring_destroy(session);
@@ -1709,7 +1721,7 @@ int kittyfb_start(
     (void)memset(&session->stats, 0, sizeof(session->stats));
     winch_flag = 0;
 
-    /* Rings are cheap metadata around potentially large in-flight mappings.
+    /* Rings are cheap metadata around potentially large in-flight objects.
      * Re-resolve on every start so suspend does not pin tmpfs and changed
      * transport options or environment are honored on resume. */
     shm_ring_destroy(session);
