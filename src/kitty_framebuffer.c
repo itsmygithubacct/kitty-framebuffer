@@ -1174,6 +1174,57 @@ static bool encode_and_write(
 
 /* --------------------------- presenter thread --------------------------- */
 
+/*
+ * Book-keep one full-frame attempt; frame_lock must be held.  Success
+ * records the encoded frame and makes it the damage-patch target; failure
+ * hands a consumed clear back to the next frame that actually reaches the
+ * screen.  A dropped frame (saturated shared-memory ring) is the same
+ * bargain the pending slot makes and must not latch.
+ *
+ * The presenter treats a cancelled or fenced write as shutdown noise and
+ * also stops its own loop when latching; the synchronous fallback runs on
+ * the caller with no thread to stop, and latches unconditionally so the
+ * caller's failed present is never silently forgotten.
+ */
+static void record_frame_outcome(
+    kittyfb_session *session,
+    bool encoded,
+    bool dropped,
+    bool clear_first,
+    int width,
+    int height,
+    bool from_presenter)
+{
+    if (encoded) {
+        session->stats.frames_encoded++;
+        displayed_session = session;
+        displayed_width = width;
+        displayed_height = height;
+        return;
+    }
+    /* A clear belongs to the next frame that actually reaches the
+     * screen.  Keep it pending across a saturated SHM ring or an
+     * encode/write failure instead of silently consuming it. */
+    if (clear_first) {
+        session->clear_pending = true;
+    }
+    if (dropped) {
+        session->stats.frames_dropped++;
+        return;
+    }
+    if (from_presenter &&
+        (__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) ||
+         __atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE))) {
+        /* A cancelled or fenced write is shutdown noise, not a failure. */
+        return;
+    }
+    session->stats.encode_failures++;
+    session->presenter_failed = true;
+    if (from_presenter) {
+        session->presenter_running = false;
+    }
+}
+
 static void *presenter_main(void *opaque)
 {
     kittyfb_session *session = opaque;
@@ -1241,35 +1292,8 @@ static void *presenter_main(void *opaque)
         pthread_mutex_unlock(&session->output_lock);
 
         pthread_mutex_lock(&session->frame_lock);
-        if (encoded) {
-            session->stats.frames_encoded++;
-            displayed_session = session;
-            displayed_width = width;
-            displayed_height = height;
-        } else {
-            /* A clear belongs to the next frame that actually reaches the
-             * screen.  Keep it pending across a saturated SHM ring or an
-             * encode/write failure instead of silently consuming it. */
-            if (clear_first) {
-                session->clear_pending = true;
-            }
-        }
-        if (!encoded && dropped) {
-            /* Every shared-memory slot is still unread.  Dropping the
-             * newest frame is the same bargain the pending slot already
-             * makes: a slow terminal costs frames, never a stall. */
-            session->stats.frames_dropped++;
-        } else if (!encoded &&
-                   !__atomic_load_n(&session->write_cancel,
-                                   __ATOMIC_ACQUIRE) &&
-                   !__atomic_load_n(&session->presenter_disabled,
-                                    __ATOMIC_ACQUIRE)) {
-            /* A cancelled or fenced write is shutdown noise, not a
-             * failure; anything else latches so the caller can stop. */
-            session->stats.encode_failures++;
-            session->presenter_failed = true;
-            session->presenter_running = false;
-        }
+        record_frame_outcome(session, encoded, dropped, clear_first,
+                             width, height, true);
         bool keep_running = session->presenter_running;
         pthread_mutex_unlock(&session->frame_lock);
         pthread_mutex_unlock(&encode_lock);
@@ -1327,22 +1351,8 @@ bool kittyfb_present(
                 session, rgba, width, height, origin, clear_first, &dropped);
             pthread_mutex_unlock(&session->output_lock);
             pthread_mutex_lock(&session->frame_lock);
-            if (encoded) {
-                session->stats.frames_encoded++;
-                displayed_session = session;
-                displayed_width = width;
-                displayed_height = height;
-            } else {
-                if (clear_first) {
-                    session->clear_pending = true;
-                }
-            }
-            if (!encoded && dropped) {
-                session->stats.frames_dropped++;
-            } else if (!encoded) {
-                session->stats.encode_failures++;
-                session->presenter_failed = true;
-            }
+            record_frame_outcome(session, encoded, dropped, clear_first,
+                                 width, height, false);
             pthread_mutex_unlock(&session->frame_lock);
             pthread_mutex_unlock(&encode_lock);
             /* A dropped frame is not a presentation failure: the caller
@@ -2114,6 +2124,89 @@ static size_t collect_damage_rects(
     return usable;
 }
 
+/* The damaged-pixel budget below which patching beats one clean frame,
+ * computed without overflowing the total * numerator product. */
+static size_t damage_budget(size_t total_pixels)
+{
+    return (total_pixels / KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
+               KITTYFB_DAMAGE_FRACTION_NUMERATOR +
+           ((total_pixels % KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
+            KITTYFB_DAMAGE_FRACTION_NUMERATOR) /
+               KITTYFB_DAMAGE_FRACTION_DENOMINATOR;
+}
+
+/*
+ * Fall back when patching cannot help or cannot work; frame_lock must be
+ * held.
+ *
+ *   - nothing on screen yet, so there is no frame to edit.
+ *     shown_image_id is pre-seeded at start, so it cannot distinguish
+ *     "nothing presented yet" - only a completed encode can;
+ *   - a frame is already queued.  Patching now would put newer
+ *     pixels on screen and then let the older frame overwrite them,
+ *     and the screen would stay wrong until something else changed.
+ *     Replacing that frame instead is the same newest-wins bargain
+ *     the pending slot already makes;
+ *   - too much changed, where per-rect overhead and many small zlib
+ *     streams cost more than one clean frame.
+ *
+ * Falling back rather than refusing is what lets a caller use this
+ * unconditionally instead of reasoning about when it pays.  A damage call
+ * treats an empty usable set as "nothing changed" before ever locking;
+ * a scroll still has its compose to place, so its caller passes
+ * empty_set_falls_back.
+ */
+static bool patch_needs_full_frame(
+    const kittyfb_session *session,
+    int width,
+    int height,
+    size_t damaged_pixels,
+    size_t damage_limit,
+    bool too_many_rects,
+    size_t usable,
+    bool empty_set_falls_back)
+{
+    return session->stats.frames_encoded == 0u ||
+           session->shown_image_id == 0 ||
+           session->frame_pending || session->clear_pending ||
+           displayed_session != session || displayed_width != width ||
+           displayed_height != height ||
+           damaged_pixels > damage_limit || too_many_rects ||
+           (empty_set_falls_back && usable == 0u) ||
+           usable >= KITTYFB_DAMAGE_MAX_RECTS;
+}
+
+/*
+ * Book-keep one synchronous patch/scroll burst and report its result.
+ * Success feeds the caller's own present/byte counters, including the DEC
+ * synchronized-update begin/end around the graphics packets, so the byte
+ * counter describes all bytes the burst emitted.  Failure latches unless
+ * the write was cancelled or fenced (shutdown noise), and wakes the
+ * presenter so it observes the stop.
+ */
+static bool finish_patch_burst(
+    kittyfb_session *session,
+    bool ok,
+    uint64_t *presents,
+    uint64_t *byte_total,
+    size_t bytes)
+{
+    pthread_mutex_lock(&session->frame_lock);
+    if (ok) {
+        (*presents)++;
+        *byte_total += bytes + 16u;
+    } else if (!__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&session->presenter_disabled,
+                                __ATOMIC_ACQUIRE)) {
+        session->stats.encode_failures++;
+        session->presenter_failed = true;
+        session->presenter_running = false;
+        pthread_cond_broadcast(&session->frame_cond);
+    }
+    pthread_mutex_unlock(&session->frame_lock);
+    return ok;
+}
+
 /* One a=f packet for one rectangle: RGB, zlib, base64, chunked. */
 static bool write_damage_rect(
     kittyfb_session *session,
@@ -2254,10 +2347,8 @@ bool kittyfb_present_damage(
     size_t usable = 0u;
     size_t damaged_pixels = 0u;
     size_t rgba_length;
-    size_t total_pixels;
     size_t damage_limit;
     int image_id;
-    bool nothing_on_screen;
     bool fallback;
     bool too_many_rects;
     size_t bytes = 0u;
@@ -2273,13 +2364,7 @@ bool kittyfb_present_damage(
     if (rects == NULL) {
         return false;
     }
-    total_pixels = rgba_length / 4u;
-    damage_limit =
-        (total_pixels / KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
-            KITTYFB_DAMAGE_FRACTION_NUMERATOR +
-        ((total_pixels % KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
-         KITTYFB_DAMAGE_FRACTION_NUMERATOR) /
-            KITTYFB_DAMAGE_FRACTION_DENOMINATOR;
+    damage_limit = damage_budget(rgba_length / 4u);
     usable = collect_damage_rects(rects, rect_count, width, height, clamped,
                                   &too_many_rects, &damaged_pixels);
     if (usable == 0u && !too_many_rects) {
@@ -2307,31 +2392,9 @@ bool kittyfb_present_damage(
         return false;
     }
     image_id = session->shown_image_id;
-    /* shown_image_id is pre-seeded at start, so it cannot distinguish
-     * "nothing presented yet" - only a completed encode can. */
-    nothing_on_screen = session->stats.frames_encoded == 0u;
-
-    /*
-     * Fall back when patching cannot help or cannot work:
-     *
-     *   - nothing on screen yet, so there is no frame to edit;
-     *   - a frame is already queued.  Patching now would put newer
-     *     pixels on screen and then let the older frame overwrite them,
-     *     and the screen would stay wrong until something else changed.
-     *     Replacing that frame instead is the same newest-wins bargain
-     *     the pending slot already makes;
-     *   - too much changed, where per-rect overhead and many small zlib
-     *     streams cost more than one clean frame.
-     *
-     * Falling back rather than refusing is what lets a caller use this
-     * unconditionally instead of reasoning about when it pays.
-     */
-    fallback = nothing_on_screen || image_id == 0 ||
-               session->frame_pending || session->clear_pending ||
-               displayed_session != session || displayed_width != width ||
-               displayed_height != height ||
-               damaged_pixels > damage_limit || too_many_rects ||
-               usable >= KITTYFB_DAMAGE_MAX_RECTS;
+    fallback = patch_needs_full_frame(session, width, height, damaged_pixels,
+                                      damage_limit, too_many_rects, usable,
+                                      false);
     if (fallback) {
         session->stats.damage_fallbacks++;
         pthread_mutex_unlock(&session->frame_lock);
@@ -2353,21 +2416,8 @@ bool kittyfb_present_damage(
     }
     pthread_mutex_unlock(&session->output_lock);
 
-    pthread_mutex_lock(&session->frame_lock);
-    if (ok) {
-        session->stats.damage_presents++;
-        /* Include the DEC synchronized-update begin/end around the graphics
-         * packets: this counter describes all bytes emitted by the patch. */
-        session->stats.damage_bytes += bytes + 16u;
-    } else if (!__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) &&
-               !__atomic_load_n(&session->presenter_disabled,
-                                __ATOMIC_ACQUIRE)) {
-        session->stats.encode_failures++;
-        session->presenter_failed = true;
-        session->presenter_running = false;
-        pthread_cond_broadcast(&session->frame_cond);
-    }
-    pthread_mutex_unlock(&session->frame_lock);
+    ok = finish_patch_burst(session, ok, &session->stats.damage_presents,
+                            &session->stats.damage_bytes, bytes);
     pthread_mutex_unlock(&encode_lock);
     return ok;
 }
@@ -2408,7 +2458,6 @@ bool kittyfb_present_scroll_region(
     size_t usable = 0u;
     size_t damaged_pixels = 0u;
     size_t rgba_length;
-    size_t total_pixels;
     size_t damage_limit;
     size_t bytes = 0u;
     bool too_many_rects = false;
@@ -2483,13 +2532,7 @@ bool kittyfb_present_scroll_region(
             &too_many_rects, &damaged_pixels);
     }
 
-    total_pixels = rgba_length / 4u;
-    damage_limit =
-        (total_pixels / KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
-            KITTYFB_DAMAGE_FRACTION_NUMERATOR +
-        ((total_pixels % KITTYFB_DAMAGE_FRACTION_DENOMINATOR) *
-         KITTYFB_DAMAGE_FRACTION_NUMERATOR) /
-            KITTYFB_DAMAGE_FRACTION_DENOMINATOR;
+    damage_limit = damage_budget(rgba_length / 4u);
 
     src_x = region.x0 + (dx < 0 ? -dx : 0);
     src_y = region.y0 + (dy < 0 ? -dy : 0);
@@ -2509,12 +2552,9 @@ bool kittyfb_present_scroll_region(
         return false;
     }
     image_id = session->shown_image_id;
-    fallback = session->stats.frames_encoded == 0u || image_id == 0 ||
-               session->frame_pending || session->clear_pending ||
-               displayed_session != session || displayed_width != width ||
-               displayed_height != height || damaged_pixels > damage_limit ||
-               too_many_rects || usable == 0u ||
-               usable >= KITTYFB_DAMAGE_MAX_RECTS;
+    fallback = patch_needs_full_frame(session, width, height, damaged_pixels,
+                                      damage_limit, too_many_rects, usable,
+                                      true);
     if (fallback) {
         session->stats.scroll_fallbacks++;
         pthread_mutex_unlock(&session->frame_lock);
@@ -2550,19 +2590,8 @@ bool kittyfb_present_scroll_region(
     }
     pthread_mutex_unlock(&session->output_lock);
 
-    pthread_mutex_lock(&session->frame_lock);
-    if (ok) {
-        session->stats.scroll_presents++;
-        session->stats.scroll_bytes += bytes + 16u;
-    } else if (!__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) &&
-               !__atomic_load_n(&session->presenter_disabled,
-                                __ATOMIC_ACQUIRE)) {
-        session->stats.encode_failures++;
-        session->presenter_failed = true;
-        session->presenter_running = false;
-        pthread_cond_broadcast(&session->frame_cond);
-    }
-    pthread_mutex_unlock(&session->frame_lock);
+    ok = finish_patch_burst(session, ok, &session->stats.scroll_presents,
+                            &session->stats.scroll_bytes, bytes);
     pthread_mutex_unlock(&encode_lock);
     return ok;
 }
