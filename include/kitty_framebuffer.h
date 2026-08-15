@@ -209,8 +209,10 @@ typedef struct kittyfb_session {
     size_t packet_capacity;
     int shown_image_id;
 
-    /* shared-memory transport; presenter thread (or the synchronous
-     * fallback) only, except for teardown under kittyfb_stop() */
+    /* shared-memory transport; slot state is guarded by frame_lock.  The
+     * presenting caller fills slots, the presenter (or the synchronous
+     * fallback) emits their packets, and kittyfb_stop() tears the ring
+     * down. */
     struct kittyfb_shm_slot *shm_slots;
     int shm_slot_count;
     bool shm_active;

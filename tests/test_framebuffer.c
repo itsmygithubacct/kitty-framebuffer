@@ -2454,6 +2454,14 @@ test_pty_shm_transport(void)
     CHECK(stats.encode_failures == 0u);
     CHECK(!kittyfb_failed(&session));
 
+    /* Frames are published straight into slot objects, so a shared-memory
+     * session never allocates the multi-megabyte pending/encode staging
+     * buffers the inline transport swaps between threads. */
+    pthread_mutex_lock(&session.frame_lock);
+    CHECK(session.pending_buffer == NULL);
+    CHECK(session.encode_buffer == NULL);
+    pthread_mutex_unlock(&session.frame_lock);
+
     /* A frame presented but never consumed leaves a live object behind,
      * which teardown must clean up. */
     CHECK(present_and_capture(&session, master, frame_b, FRAME_W, FRAME_H, 9u,

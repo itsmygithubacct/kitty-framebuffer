@@ -716,7 +716,9 @@ static void shm_slot_release(struct kittyfb_shm_slot *slot)
         (void)close(slot->fd);
         slot->fd = -1;
     }
+    slot->size = 0u;
     slot->busy = false;
+    slot->queued = false;
 }
 
 /*
@@ -779,33 +781,73 @@ static bool shm_slot_store(int fd, const uint8_t *data, size_t size)
     return true;
 }
 
+/* Roll back a slot whose packet never completed.  Leaving its still-present
+ * name marked busy would permanently shrink the ring because no terminal was
+ * given a complete request that could unlink it. */
+static void shm_slot_discard(struct kittyfb_shm_slot *slot)
+{
+    (void)shm_unlink(slot->name);
+    shm_slot_release(slot);
+}
+
 /*
- * Copy `size` bytes into a free slot and return the slot, or NULL when
- * every slot is still in flight (the caller drops the frame) or the
- * object could not be created.  *saturated distinguishes the two.
+ * Hand the caller's frame straight to the ring; frame_lock must be held.
+ * The pixels land in a slot object with one full-file write - the only
+ * copy the transport makes.
+ *
+ * Preference order: overwrite the queued-but-unsent slot, dropping the
+ * older frame exactly as the inline pending slot drops an undelivered
+ * frame; otherwise fill a free slot; otherwise every slot is
+ * terminal-owned and unread, and this frame is dropped (*dropped).
+ * Returns false with *dropped clear only when the object could not be
+ * created or written.
  */
-static struct kittyfb_shm_slot *shm_ring_publish(
+static bool shm_enqueue_frame(
     kittyfb_session *session,
     const uint8_t *data,
     size_t size,
-    bool *saturated)
+    int width,
+    int height,
+    bool *dropped)
 {
     struct kittyfb_shm_slot *slot = NULL;
 
-    *saturated = false;
-    if (shm_ring_reap(session) == 0) {
-        *saturated = true;
-        return NULL;
-    }
+    *dropped = false;
     for (int index = 0; index < session->shm_slot_count; index++) {
-        if (!session->shm_slots[index].busy) {
+        if (session->shm_slots[index].queued) {
             slot = &session->shm_slots[index];
             break;
         }
     }
+    if (slot != NULL) {
+        /* Replace the queued frame in place.  A failed shrink or store
+         * leaves unknown bytes in the object, so the slot cannot stay
+         * queued for the presenter; roll it back and report the failure. */
+        if ((slot->size != size &&
+             ftruncate(slot->fd, (off_t)size) != 0) ||
+            !shm_slot_store(slot->fd, data, size)) {
+            shm_slot_discard(slot);
+            session->frame_pending = false;
+            return false;
+        }
+        session->stats.frames_dropped++;
+        slot->size = size;
+        slot->width = width;
+        slot->height = height;
+        return true;
+    }
+
+    if (shm_ring_reap(session) > 0) {
+        for (int index = 0; index < session->shm_slot_count; index++) {
+            if (!session->shm_slots[index].busy) {
+                slot = &session->shm_slots[index];
+                break;
+            }
+        }
+    }
     if (slot == NULL) {
-        *saturated = true;
-        return NULL;
+        *dropped = true;
+        return false;
     }
 
     int fd = shm_open(slot->name, O_RDWR | O_CREAT | O_EXCL, 0600);
@@ -816,26 +858,21 @@ static struct kittyfb_shm_slot *shm_ring_publish(
         fd = shm_open(slot->name, O_RDWR | O_CREAT | O_EXCL, 0600);
     }
     if (fd < 0) {
-        return NULL;
+        return false;
     }
     if (!shm_slot_store(fd, data, size)) {
         (void)close(fd);
         (void)shm_unlink(slot->name);
-        return NULL;
+        return false;
     }
 
     slot->fd = fd;
+    slot->size = size;
+    slot->width = width;
+    slot->height = height;
     slot->busy = true;
-    return slot;
-}
-
-/* Roll back a slot whose packet never completed.  Leaving its still-present
- * name marked busy would permanently shrink the ring because no terminal was
- * given a complete request that could unlink it. */
-static void shm_slot_discard(struct kittyfb_shm_slot *slot)
-{
-    (void)shm_unlink(slot->name);
-    shm_slot_release(slot);
+    slot->queued = true;
+    return true;
 }
 
 static void shm_ring_destroy(kittyfb_session *session)
@@ -968,39 +1005,23 @@ int kittyfb_reap_orphans(void)
 /* Runs on the presenter thread, or on the caller when thread creation
  * failed; either way it is the only user of the encoder scratch. */
 /*
- * The shared-memory path: no alpha strip and no compression, because
+ * Write the ~100-byte t=s packet naming an already-filled slot; the
+ * shared-memory transport has no alpha strip and no compression, because
  * neither byte saving buys anything once the pixels stop travelling down
- * the terminal connection.  The frame is copied once, into the slot.
- *
- * Returns true when the packet was written.  On a saturated ring it
- * returns false with *dropped set: that is a dropped frame, matching the
- * newest-frame-wins policy, and must not be mistaken for a failure.
+ * the terminal connection.  encode_lock must be held (packet scratch and
+ * shown_image_id); frame_lock must not be.  The caller owns the slot's
+ * ring state and rolls it back when this fails.
  */
-static bool publish_shm(
+static bool shm_emit_slot(
     kittyfb_session *session,
-    const uint8_t *rgba,
+    const struct kittyfb_shm_slot *slot,
     int width,
     int height,
     const char *origin,
-    bool clear_first,
-    bool *dropped)
+    bool clear_first)
 {
-    size_t size;
-    bool saturated = false;
-    struct kittyfb_shm_slot *slot;
-
-    if (!frame_byte_count(width, height, &size)) {
-        return false;
-    }
-    slot = shm_ring_publish(session, rgba, size, &saturated);
-
-    if (slot == NULL) {
-        *dropped = saturated;
-        return false;
-    }
     if (__atomic_load_n(&session->write_cancel, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE)) {
-        shm_slot_discard(slot);
         return false;
     }
 
@@ -1011,7 +1032,6 @@ static bool publish_shm(
     size_t packet_needed = KITTYFB_SHM_NAME_MAX * 2u + 512u;
     if (!grow_chars(&session->packet_buffer, &session->packet_capacity,
                     packet_needed)) {
-        shm_slot_discard(slot);
         return false;
     }
     size_t packet_length = kittyfb_build_shm_packet(
@@ -1025,16 +1045,15 @@ static bool publish_shm(
         origin,
         clear_first);
     if (packet_length == 0) {
-        shm_slot_discard(slot);
         return false;
     }
 
+    /* Re-check the fence right before the write: if a restore raced in
+     * after the top check, this frame's packet must not go out at all. */
     if (__atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE)) {
-        shm_slot_discard(slot);
         return false;
     }
     if (!write_all(session, session->packet_buffer, packet_length)) {
-        shm_slot_discard(slot);
         return false;
     }
     session->shown_image_id = new_id;
@@ -1082,12 +1101,9 @@ static bool encode_and_write(
     int width,
     int height,
     const char *origin,
-    bool clear_first,
-    bool *dropped)
+    bool clear_first)
 {
     size_t rgba_length;
-
-    *dropped = false;
 
     /* A signal-time restore has fenced the presenter: emit nothing. */
     if (__atomic_load_n(&session->presenter_disabled, __ATOMIC_ACQUIRE) ||
@@ -1096,11 +1112,6 @@ static bool encode_and_write(
     }
     if (rgba == NULL || !frame_byte_count(width, height, &rgba_length)) {
         return false;
-    }
-
-    if (session->shm_active) {
-        return publish_shm(session, rgba, width, height, origin, clear_first,
-                           dropped);
     }
 
     /* strip the (ignored) alpha channel: 25% less data to compress,
@@ -1240,6 +1251,61 @@ static void record_frame_outcome(
     }
 }
 
+/*
+ * Claim the queued shared-memory slot and put its packet on the wire;
+ * encode_lock must be held, frame_lock must not be.  Clearing `queued`
+ * under frame_lock is the claim: from that moment no newer frame may
+ * overwrite the slot, because its name is about to reach the terminal.
+ * A packet that never completes is rolled back so the ring keeps its
+ * width - no terminal received a request that could unlink the slot.
+ */
+static bool shm_present_queued(kittyfb_session *session, bool from_presenter)
+{
+    struct kittyfb_shm_slot *slot = NULL;
+    char origin[sizeof(session->origin_sequence)];
+    int width;
+    int height;
+    bool clear_first;
+    bool ok;
+
+    pthread_mutex_lock(&session->frame_lock);
+    for (int index = 0; index < session->shm_slot_count; index++) {
+        if (session->shm_slots[index].queued) {
+            slot = &session->shm_slots[index];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        session->frame_pending = false;
+        pthread_mutex_unlock(&session->frame_lock);
+        return true;
+    }
+    slot->queued = false;
+    width = slot->width;
+    height = slot->height;
+    memcpy(origin, session->origin_sequence, sizeof(origin));
+    clear_first = session->clear_pending;
+    session->clear_pending = false;
+    session->frame_pending = false;
+    pthread_mutex_unlock(&session->frame_lock);
+
+    /* Nothing else may write to the terminal while the packet goes out:
+     * a damage patch landing inside it would interleave escape
+     * sequences. */
+    pthread_mutex_lock(&session->output_lock);
+    ok = shm_emit_slot(session, slot, width, height, origin, clear_first);
+    pthread_mutex_unlock(&session->output_lock);
+
+    pthread_mutex_lock(&session->frame_lock);
+    if (!ok) {
+        shm_slot_discard(slot);
+    }
+    record_frame_outcome(session, ok, false, clear_first, width, height,
+                         from_presenter);
+    pthread_mutex_unlock(&session->frame_lock);
+    return ok;
+}
+
 static void *presenter_main(void *opaque)
 {
     kittyfb_session *session = opaque;
@@ -1271,6 +1337,20 @@ static void *presenter_main(void *opaque)
             pthread_mutex_unlock(&encode_lock);
             continue;
         }
+        if (session->shm_active) {
+            /* The caller already filled a slot; only the packet write is
+             * left, and it needs no staging buffers. */
+            pthread_mutex_unlock(&session->frame_lock);
+            (void)shm_present_queued(session, true);
+            pthread_mutex_lock(&session->frame_lock);
+            bool still_running = session->presenter_running;
+            pthread_mutex_unlock(&session->frame_lock);
+            pthread_mutex_unlock(&encode_lock);
+            if (!still_running) {
+                break;
+            }
+            continue;
+        }
         /* Swap buffers together with their capacities: the caller keeps
          * writing new frames into pending_buffer while this one encodes
          * from encode_buffer.  The caller only ever grows the pending
@@ -1291,7 +1371,6 @@ static void *presenter_main(void *opaque)
         session->frame_pending = false;
         pthread_mutex_unlock(&session->frame_lock);
 
-        bool dropped = false;
         /* Nothing else may write to the terminal while this frame goes
          * out: a damage patch landing between two of its writes would
          * interleave escape sequences. */
@@ -1302,12 +1381,11 @@ static void *presenter_main(void *opaque)
             width,
             height,
             origin,
-            clear_first,
-            &dropped);
+            clear_first);
         pthread_mutex_unlock(&session->output_lock);
 
         pthread_mutex_lock(&session->frame_lock);
-        record_frame_outcome(session, encoded, dropped, clear_first,
+        record_frame_outcome(session, encoded, false, clear_first,
                              width, height, true);
         bool keep_running = session->presenter_running;
         pthread_mutex_unlock(&session->frame_lock);
@@ -1340,12 +1418,16 @@ bool kittyfb_present(
     }
     /* Only the pending buffer may be grown here: the presenter could be
      * mid-encode on encode_buffer and realloc would free it under its
-     * feet.  The capacities travel with the buffers through the swap. */
-    if (!grow_bytes(&session->pending_buffer, &session->pending_capacity,
+     * feet.  The capacities travel with the buffers through the swap.
+     * A shared-memory session publishes straight into a slot object and
+     * needs neither staging buffer at all. */
+    if (!session->shm_active &&
+        !grow_bytes(&session->pending_buffer, &session->pending_capacity,
                     needed)) {
         pthread_mutex_unlock(&session->frame_lock);
         return false;
     }
+    bool synchronous = false;
     if (!session->presenter_started) {
         session->presenter_running = true;
         if (pthread_create(&session->presenter_thread, NULL, presenter_main,
@@ -1353,30 +1435,70 @@ bool kittyfb_present(
             /* Synchronous fallback; thread creation is retried on the
              * next present. */
             session->presenter_running = false;
-            char origin[sizeof(session->origin_sequence)];
-            memcpy(origin, session->origin_sequence, sizeof(origin));
-            bool clear_first = session->clear_pending;
-            session->clear_pending = false;
-            session->stats.frames_presented++;
-            pthread_mutex_unlock(&session->frame_lock);
-            pthread_mutex_lock(&encode_lock);
-            bool dropped = false;
-            pthread_mutex_lock(&session->output_lock);
-            bool encoded = encode_and_write(
-                session, rgba, width, height, origin, clear_first, &dropped);
-            pthread_mutex_unlock(&session->output_lock);
-            pthread_mutex_lock(&session->frame_lock);
-            record_frame_outcome(session, encoded, dropped, clear_first,
-                                 width, height, false);
-            pthread_mutex_unlock(&session->frame_lock);
-            pthread_mutex_unlock(&encode_lock);
-            /* A dropped frame is not a presentation failure: the caller
-             * should keep sending frames, exactly as it does when the
-             * pending slot is overwritten. */
-            return encoded || dropped;
+            synchronous = true;
+        } else {
+            session->presenter_started = true;
         }
-        session->presenter_started = true;
     }
+
+    if (session->shm_active) {
+        /* Publish from here: reap and fill a slot with the caller's own
+         * pixels, and leave the presenter only the ~100-byte packet.
+         * The frame never passes through a staging buffer, so the
+         * transport costs one copy - into the slot object - instead of
+         * two plus a fresh mapping per frame. */
+        bool dropped = false;
+
+        if (!shm_enqueue_frame(session, rgba, needed, width, height,
+                               &dropped)) {
+            if (dropped) {
+                /* Every slot is terminal-owned and unread.  Dropping the
+                 * newest frame is the same bargain the pending slot
+                 * makes: a slow terminal costs frames, never a stall. */
+                session->stats.frames_presented++;
+                session->stats.frames_dropped++;
+                pthread_mutex_unlock(&session->frame_lock);
+                return true;
+            }
+            session->stats.encode_failures++;
+            session->presenter_failed = true;
+            pthread_mutex_unlock(&session->frame_lock);
+            return false;
+        }
+        session->frame_pending = true;
+        session->stats.frames_presented++;
+        if (!synchronous) {
+            pthread_cond_signal(&session->frame_cond);
+            pthread_mutex_unlock(&session->frame_lock);
+            return true;
+        }
+        pthread_mutex_unlock(&session->frame_lock);
+        pthread_mutex_lock(&encode_lock);
+        bool emitted = shm_present_queued(session, false);
+        pthread_mutex_unlock(&encode_lock);
+        return emitted;
+    }
+
+    if (synchronous) {
+        char origin[sizeof(session->origin_sequence)];
+        memcpy(origin, session->origin_sequence, sizeof(origin));
+        bool clear_first = session->clear_pending;
+        session->clear_pending = false;
+        session->stats.frames_presented++;
+        pthread_mutex_unlock(&session->frame_lock);
+        pthread_mutex_lock(&encode_lock);
+        pthread_mutex_lock(&session->output_lock);
+        bool encoded = encode_and_write(
+            session, rgba, width, height, origin, clear_first);
+        pthread_mutex_unlock(&session->output_lock);
+        pthread_mutex_lock(&session->frame_lock);
+        record_frame_outcome(session, encoded, false, clear_first,
+                             width, height, false);
+        pthread_mutex_unlock(&session->frame_lock);
+        pthread_mutex_unlock(&encode_lock);
+        return encoded;
+    }
+
     /* overwriting an undelivered frame = dropping it in favor of this one */
     if (session->frame_pending) {
         session->stats.frames_dropped++;

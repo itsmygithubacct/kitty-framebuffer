@@ -36,11 +36,21 @@ extern "C" {
  * has finished with it, and it is what the link count is read through.
  * The pixels are written through the fd; the producer never maps the
  * object.
+ *
+ * A busy slot is additionally "queued" between the caller filling it and
+ * the presenter writing its packet.  Only a queued slot may be
+ * overwritten by a newer frame - that is the newest-frame-wins drop -
+ * because once the packet is on the wire the terminal owns the pixels.
+ * All slot state is guarded by the session's frame_lock.
  */
 struct kittyfb_shm_slot {
     char name[KITTYFB_SHM_NAME_MAX];
+    size_t size;        /* current object size in bytes */
+    int width;          /* queued frame dimensions for the packet */
+    int height;
     int fd;
     bool busy;
+    bool queued;
 };
 
 typedef struct kittyfb_geometry {
