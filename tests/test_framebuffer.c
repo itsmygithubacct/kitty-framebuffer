@@ -2000,6 +2000,95 @@ test_pty_patch_burst_wire_sequence(void)
     return true;
 }
 
+/*
+ * The bounded damage form must behave exactly like the blocking one when
+ * the serializer is free - including the automatic full-frame fallback -
+ * and must decline with BUSY, writing nothing and latching nothing, when
+ * another writer owns the output.
+ */
+static bool
+test_pty_try_damage_declines_when_busy(void)
+{
+    enum { FRAME_W = 64, FRAME_H = 48 };
+    int master = -1;
+    int slave = -1;
+    kittyfb_session session;
+    kittyfb_options options;
+    kittyfb_stats stats;
+    static uint8_t frame[(size_t)FRAME_W * FRAME_H * 4u];
+    static char buffer[262144];
+    size_t used = 0u;
+    kittyfb_rect rect = {8, 4, 20, 12};
+
+    CHECK(open_test_pty(&master, &slave, 100, 30, 900, 540, NULL));
+    kittyfb_session_init(&session);
+    kittyfb_options_init(&options);
+    options.transport = KITTYFB_TRANSPORT_INLINE;
+    CHECK(start_with_fake_terminal(&session, master, slave, &options,
+                                   graphics_reply, NULL) == 0);
+    drain_descriptor(master);
+
+    /* Bad arguments are errors, exactly as in the blocking form. */
+    CHECK(kittyfb_try_present_damage(NULL, frame, FRAME_W, FRAME_H,
+                                     &rect, 1u) == KITTYFB_PRESENT_ERROR);
+    CHECK(kittyfb_try_present_damage(&session, NULL, FRAME_W, FRAME_H,
+                                     &rect, 1u) == KITTYFB_PRESENT_ERROR);
+
+    /* Nothing on screen yet: the fallback still applies and still counts
+     * as OK - the newest pixels reached the queue. */
+    fill_test_frame(frame, FRAME_W, FRAME_H, 1u);
+    CHECK(kittyfb_try_present_damage(&session, frame, FRAME_W, FRAME_H,
+                                     &rect, 1u) == KITTYFB_PRESENT_OK);
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=T"));
+    CHECK(wait_for_encoded_frames(&session, 1u));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_fallbacks == 1u);
+    drain_descriptor(master);
+
+    /* Free serializer: patches in place like the blocking form. */
+    fill_test_frame(frame, FRAME_W, FRAME_H, 2u);
+    CHECK(kittyfb_try_present_damage(&session, frame, FRAME_W, FRAME_H,
+                                     &rect, 1u) == KITTYFB_PRESENT_OK);
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=f"));
+    CHECK(!wire_has(buffer, used, "a=T"));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_presents == 1u);
+
+    /* Output owned by another writer: decline immediately, emit nothing,
+     * latch nothing.  The caller keeps its damage and retries. */
+    pthread_mutex_lock(&session.output_lock);
+    CHECK(kittyfb_try_present_damage(&session, frame, FRAME_W, FRAME_H,
+                                     &rect, 1u) == KITTYFB_PRESENT_BUSY);
+    pthread_mutex_unlock(&session.output_lock);
+    sleep_milliseconds(30);
+    CHECK(read_available(master, buffer, sizeof(buffer)) == 0u);
+    CHECK(!kittyfb_failed(&session));
+    kittyfb_get_stats(&session, &stats);
+    CHECK(stats.damage_presents == 1u);
+    CHECK(stats.damage_fallbacks == 1u);
+    CHECK(stats.encode_failures == 0u);
+
+    /* And the very next attempt succeeds. */
+    fill_test_frame(frame, FRAME_W, FRAME_H, 3u);
+    CHECK(kittyfb_try_present_damage(&session, frame, FRAME_W, FRAME_H,
+                                     &rect, 1u) == KITTYFB_PRESENT_OK);
+    used = 0u;
+    CHECK(wait_for_bytes(master, buffer, sizeof(buffer), &used,
+                         "\x1b[?2026l", 8u));
+    CHECK(wire_has(buffer, used, "a=f"));
+
+    kittyfb_stop(&session);
+    CHECK(close(master) == 0);
+    CHECK(close(slave) == 0);
+    return true;
+}
+
 static bool
 test_pty_shm_frame_accepts_inline_damage(void)
 {
@@ -2755,6 +2844,8 @@ main(void)
          test_pty_damage_multichunk_protocol},
         {"PTY patch burst wire sequence",
          test_pty_patch_burst_wire_sequence},
+        {"PTY try damage declines when busy",
+         test_pty_try_damage_declines_when_busy},
         {"PTY shm frame accepts inline damage",
          test_pty_shm_frame_accepts_inline_damage},
         {"PTY scroll compose and fallback",

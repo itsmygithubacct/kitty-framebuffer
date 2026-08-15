@@ -336,6 +336,13 @@ typedef struct kittyfb_rect {
  * This call is synchronous and serializes with the asynchronous full-frame
  * encoder/writer; the final on-screen result therefore follows API call order.
  *
+ * Worst-case block: the shared serializer may be held across a complete
+ * full-frame encode AND terminal write, and every write burst tolerates
+ * up to 40 consecutive stalled 50 ms polls - roughly two seconds, and
+ * longer still on a connection that trickles just enough to reset the
+ * stall counter.  A caller that must not wait that long should use
+ * kittyfb_try_present_damage() and coalesce its damage while busy.
+ *
  * Returns false on invalid arguments, an inactive session, or a latched
  * presenter failure.  Rects are clamped to the framebuffer; empty or
  * inverted ones are skipped rather than rejected, because a caller
@@ -343,6 +350,39 @@ typedef struct kittyfb_rect {
  * frame edges.
  */
 bool kittyfb_present_damage(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    const kittyfb_rect *rects,
+    size_t rect_count);
+
+/* The outcome of a bounded present attempt. */
+typedef enum kittyfb_present_result {
+    KITTYFB_PRESENT_ERROR = -1, /* what the bool functions report as false */
+    KITTYFB_PRESENT_OK = 0,     /* patched, or fell back to a full frame */
+    KITTYFB_PRESENT_BUSY = 1    /* serializer held; nothing was written */
+} kittyfb_present_result;
+
+/*
+ * kittyfb_present_damage() without the unbounded wait: when the shared
+ * encoder/output serializer is already held - typically by a full-frame
+ * encode and write to a slow terminal - this returns
+ * KITTYFB_PRESENT_BUSY immediately instead of blocking the caller behind
+ * it, and writes nothing.  Everything else (validation, coalescing, the
+ * automatic full-frame fallback) matches kittyfb_present_damage().
+ *
+ * On BUSY the screen still shows the previous state and no failure is
+ * latched.  The caller keeps its damage, coalesces it with the next
+ * update, and retries; patches carry only their own rectangles, so
+ * damage that is discarded rather than retried would leave those regions
+ * stale until something else redraws them.
+ *
+ * BUSY only covers the serializer.  Once acquired, the call's own write
+ * is still subject to the write-burst stall budget above - but that is
+ * the caller's own small patch, not another thread's full frame.
+ */
+kittyfb_present_result kittyfb_try_present_damage(
     kittyfb_session *session,
     const uint8_t *rgba,
     int width,
@@ -384,6 +424,10 @@ bool kittyfb_present_scroll(
  * the terminal's retained pixels exactly where the application preserves them,
  * reducing both protocol traffic and the number of states that must be composed
  * atomically.  The same capability checks and full-frame fallback apply.
+ *
+ * Both scroll forms are synchronous and share kittyfb_present_damage()'s
+ * serializer, including its worst-case block behind a stalled full-frame
+ * write.
  */
 bool kittyfb_present_scroll_region(
     kittyfb_session *session,

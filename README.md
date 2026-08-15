@@ -92,6 +92,16 @@ something else redraws it. Damage and full-frame writes share one serializer, so
 the final on-screen result follows API call order and their protocol bytes cannot
 interleave.
 
+That shared serializer has a real worst case: it can be held across a complete
+full-frame encode plus terminal write, and each write burst tolerates up to 40
+consecutive stalled 50 ms polls — about two seconds, and longer on a connection
+that trickles just enough to reset the stall counter. A caller on a
+latency-sensitive thread uses the bounded form instead:
+`kittyfb_try_present_damage()` returns `KITTYFB_PRESENT_BUSY` immediately when
+the serializer is held, writes nothing, and latches nothing; the caller keeps
+its damage, coalesces it with the next update, and retries. Everything else,
+including the automatic full-frame fallback, matches the blocking form.
+
 ## Scroll composition
 
 `kittyfb_present_scroll_region()` handles a common retained-image update without

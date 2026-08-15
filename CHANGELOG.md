@@ -17,6 +17,19 @@
   shared memory, retaining the cheapest transport for both update sizes.
 - Add scroll presentation, fallback, byte, mixed-transport, and wire-protocol
   coverage.
+- Publish shared-memory frames from the presenting caller: pixels are written
+  once, straight into the slot object through its descriptor, instead of being
+  staged in a pending buffer, re-copied, and mapped per frame. Shared-memory
+  sessions no longer allocate the full-frame staging buffers; newest-frame-wins,
+  saturation drops, and rollback semantics are unchanged.
+- Detect consumed shared-memory slots with one fstat of the held descriptor
+  instead of a per-slot shm_open probe on every publish.
+- Assemble each damage or scroll burst — synchronized-update markers, compose,
+  and every rect packet — into one buffer and issue a single write, with
+  byte-identical wire output.
+- Add `kittyfb_try_present_damage()`, a bounded damage present that returns
+  busy instead of blocking behind an in-flight full-frame write, and document
+  the synchronous forms' worst-case wait.
 
 ## 0.4.0 — Unreleased
 

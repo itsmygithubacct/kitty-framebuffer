@@ -2488,13 +2488,14 @@ static bool append_damage_rect(
     return true;
 }
 
-bool kittyfb_present_damage(
+static kittyfb_present_result present_damage_run(
     kittyfb_session *session,
     const uint8_t *rgba,
     int width,
     int height,
     const kittyfb_rect *rects,
-    size_t rect_count)
+    size_t rect_count,
+    bool wait)
 {
     kittyfb_rect clamped[KITTYFB_DAMAGE_MAX_RECTS];
     size_t usable = 0u;
@@ -2509,19 +2510,19 @@ bool kittyfb_present_damage(
 
     if (session == NULL || !session->active || rgba == NULL ||
         !frame_byte_count(width, height, &rgba_length)) {
-        return false;
+        return KITTYFB_PRESENT_ERROR;
     }
     if (rect_count == 0u) {
-        return true;   /* nothing changed; not an error */
+        return KITTYFB_PRESENT_OK;   /* nothing changed; not an error */
     }
     if (rects == NULL) {
-        return false;
+        return KITTYFB_PRESENT_ERROR;
     }
     damage_limit = damage_budget(rgba_length / 4u);
     usable = collect_damage_rects(rects, rect_count, width, height, clamped,
                                   &too_many_rects, &damaged_pixels);
     if (usable == 0u && !too_many_rects) {
-        return true;
+        return KITTYFB_PRESENT_OK;
     }
 
     /*
@@ -2533,16 +2534,29 @@ bool kittyfb_present_damage(
      * Both full-frame paths take the locks in this order.  Owning them also
      * makes frame_pending a reliable answer to whether an older frame is
      * queued or in flight.
+     *
+     * A bounded caller declines to wait here: the serializer may be held
+     * across a full-frame encode and a stalled terminal write, and BUSY
+     * lets it coalesce and retry instead of blocking behind that.
      */
-    pthread_mutex_lock(&encode_lock);
-    pthread_mutex_lock(&session->output_lock);
+    if (wait) {
+        pthread_mutex_lock(&encode_lock);
+    } else if (pthread_mutex_trylock(&encode_lock) != 0) {
+        return KITTYFB_PRESENT_BUSY;
+    }
+    if (wait) {
+        pthread_mutex_lock(&session->output_lock);
+    } else if (pthread_mutex_trylock(&session->output_lock) != 0) {
+        pthread_mutex_unlock(&encode_lock);
+        return KITTYFB_PRESENT_BUSY;
+    }
     pthread_mutex_lock(&session->frame_lock);
     if (!session->active || session->presenter_failed ||
         (session->presenter_started && !session->presenter_running)) {
         pthread_mutex_unlock(&session->frame_lock);
         pthread_mutex_unlock(&session->output_lock);
         pthread_mutex_unlock(&encode_lock);
-        return false;
+        return KITTYFB_PRESENT_ERROR;
     }
     image_id = session->shown_image_id;
     fallback = patch_needs_full_frame(session, width, height, damaged_pixels,
@@ -2553,7 +2567,9 @@ bool kittyfb_present_damage(
         pthread_mutex_unlock(&session->frame_lock);
         pthread_mutex_unlock(&session->output_lock);
         pthread_mutex_unlock(&encode_lock);
-        return kittyfb_present(session, rgba, width, height);
+        return kittyfb_present(session, rgba, width, height)
+                   ? KITTYFB_PRESENT_OK
+                   : KITTYFB_PRESENT_ERROR;
     }
     pthread_mutex_unlock(&session->frame_lock);
 
@@ -2582,7 +2598,31 @@ bool kittyfb_present_damage(
     ok = finish_patch_burst(session, ok, &session->stats.damage_presents,
                             &session->stats.damage_bytes, bytes);
     pthread_mutex_unlock(&encode_lock);
-    return ok;
+    return ok ? KITTYFB_PRESENT_OK : KITTYFB_PRESENT_ERROR;
+}
+
+bool kittyfb_present_damage(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    const kittyfb_rect *rects,
+    size_t rect_count)
+{
+    return present_damage_run(session, rgba, width, height, rects,
+                              rect_count, true) == KITTYFB_PRESENT_OK;
+}
+
+kittyfb_present_result kittyfb_try_present_damage(
+    kittyfb_session *session,
+    const uint8_t *rgba,
+    int width,
+    int height,
+    const kittyfb_rect *rects,
+    size_t rect_count)
+{
+    return present_damage_run(session, rgba, width, height, rects,
+                              rect_count, false);
 }
 
 static bool kilix_scroll_compose_available(void)
