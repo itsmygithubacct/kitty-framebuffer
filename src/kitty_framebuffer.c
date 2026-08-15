@@ -2207,14 +2207,33 @@ static bool finish_patch_burst(
     return ok;
 }
 
-/* One a=f packet for one rectangle: RGB, zlib, base64, chunked. */
-static bool write_damage_rect(
+/* Append raw bytes to the packet buffer at *length, growing it as needed. */
+static bool append_packet_bytes(
+    kittyfb_session *session,
+    const char *data,
+    size_t size,
+    size_t *length)
+{
+    if (size > SIZE_MAX - *length ||
+        !grow_chars(&session->packet_buffer, &session->packet_capacity,
+                    *length + size)) {
+        return false;
+    }
+    memcpy(session->packet_buffer + *length, data, size);
+    *length += size;
+    return true;
+}
+
+/* One a=f packet for one rectangle - RGB, zlib, base64, chunked -
+ * appended to the packet buffer at *packet_length so a whole burst
+ * accumulates into one contiguous write. */
+static bool append_damage_rect(
     kittyfb_session *session,
     const uint8_t *rgba,
     int width,
     const kittyfb_rect *rect,
     int image_id,
-    size_t *bytes_written)
+    size_t *packet_length)
 {
     const int rect_width = rect->x1 - rect->x0;
     const int rect_height = rect->y1 - rect->y0;
@@ -2223,7 +2242,6 @@ static bool write_damage_rect(
     uLongf z_length;
     size_t encoded_length;
     size_t needed;
-    bool ok = true;
 
     if (!grow_bytes(&session->rgb_buffer, &session->rgb_capacity, rgb_length)) {
         return false;
@@ -2266,7 +2284,7 @@ static bool write_damage_rect(
     encoded_length = kittyfb_base64_encode(
         session->z_buffer, (size_t)z_length, session->b64_buffer);
 
-    /* Build a rect into one contiguous write rather than issuing three
+    /* Build the rect's chunks contiguously rather than issuing three
      * syscalls per 4 KiB chunk.  Animation-frame continuations must repeat
      * a=f, but the protocol permits only a=f, m, and optional q after the
      * first chunk.  In particular, repeating the image id aborts the load. */
@@ -2284,12 +2302,13 @@ static bool write_damage_rect(
             return false;
         }
         packet_needed = encoded_length + chunk_count * 194u;
-        if (!grow_chars(&session->packet_buffer, &session->packet_capacity,
-                        packet_needed)) {
+        if (packet_needed > SIZE_MAX - *packet_length ||
+            !grow_chars(&session->packet_buffer, &session->packet_capacity,
+                        *packet_length + packet_needed)) {
             return false;
         }
-        at = session->packet_buffer;
-        remaining = session->packet_capacity;
+        at = session->packet_buffer + *packet_length;
+        remaining = session->packet_capacity - *packet_length;
 
         while (offset < encoded_length) {
             size_t count = encoded_length - offset;
@@ -2326,13 +2345,10 @@ static bool write_damage_rect(
             remaining -= count + 2u;
             offset += count;
         }
-        size_t packet_length = (size_t)(at - session->packet_buffer);
-        ok = write_all(session, session->packet_buffer, packet_length);
-        if (ok) {
-            *bytes_written += packet_length;
-        }
+        *packet_length =
+            (size_t)(at - session->packet_buffer);
     }
-    return ok;
+    return true;
 }
 
 bool kittyfb_present_damage(
@@ -2405,14 +2421,24 @@ bool kittyfb_present_damage(
     pthread_mutex_unlock(&session->frame_lock);
 
     /* One synchronized update around every patch, so the screen never
-     * shows a half-applied edit. */
-    ok = write_all(session, "\x1b[?2026h", 8u);
-    for (size_t i = 0u; i < usable && ok; i++) {
-        ok = write_damage_rect(session, rgba, width, &clamped[i], image_id,
-                               &bytes);
-    }
-    if (!write_all(session, "\x1b[?2026l", 8u)) {
-        ok = false;
+     * shows a half-applied edit.  Assemble the whole burst - begin
+     * marker, every patch packet, end marker - and issue one write: a
+     * many-rect present costs one poll-guarded burst instead of one per
+     * rect plus two, and a failure while building can no longer leave a
+     * partially-transmitted update on the wire. */
+    {
+        size_t burst = 0u;
+
+        ok = append_packet_bytes(session, "\x1b[?2026h", 8u, &burst);
+        for (size_t i = 0u; i < usable && ok; i++) {
+            ok = append_damage_rect(session, rgba, width, &clamped[i],
+                                    image_id, &burst);
+        }
+        ok = ok && append_packet_bytes(session, "\x1b[?2026l", 8u, &burst);
+        ok = ok && write_all(session, session->packet_buffer, burst);
+        if (ok) {
+            bytes = burst - 16u;
+        }
     }
     pthread_mutex_unlock(&session->output_lock);
 
@@ -2462,7 +2488,6 @@ bool kittyfb_present_scroll_region(
     size_t bytes = 0u;
     bool too_many_rects = false;
     bool fallback;
-    bool began_update = false;
     bool ok = true;
     int image_id;
     int src_x;
@@ -2571,22 +2596,24 @@ bool kittyfb_present_scroll_region(
     if (compose_length < 0 || (size_t)compose_length >= sizeof(compose)) {
         ok = false;
     }
-    if (ok) {
-        ok = write_all(session, "\x1b[?2026h", 8u);
-        began_update = ok;
-    }
-    if (ok) {
-        ok = write_all(session, compose, (size_t)compose_length);
-        if (ok) {
-            bytes += (size_t)compose_length;
+    /* As in the damage path: the compose and every exposed-strip patch
+     * form one synchronized update, assembled first and written as one
+     * burst. */
+    {
+        size_t burst = 0u;
+
+        ok = ok && append_packet_bytes(session, "\x1b[?2026h", 8u, &burst);
+        ok = ok && append_packet_bytes(session, compose,
+                                       (size_t)compose_length, &burst);
+        for (size_t i = 0u; i < usable && ok; i++) {
+            ok = append_damage_rect(session, rgba, width, &clamped[i],
+                                    image_id, &burst);
         }
-    }
-    for (size_t i = 0u; i < usable && ok; i++) {
-        ok = write_damage_rect(session, rgba, width, &clamped[i], image_id,
-                               &bytes);
-    }
-    if (began_update && !write_all(session, "\x1b[?2026l", 8u)) {
-        ok = false;
+        ok = ok && append_packet_bytes(session, "\x1b[?2026l", 8u, &burst);
+        ok = ok && write_all(session, session->packet_buffer, burst);
+        if (ok) {
+            bytes = burst - 16u;
+        }
     }
     pthread_mutex_unlock(&session->output_lock);
 
