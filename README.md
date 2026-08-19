@@ -52,8 +52,8 @@ owner is gone without touching a running session's frames. A normal
 `kittyfb_stop()` already releases this session's objects.
 
 The library is presentation only. Keyboard input is a separate concern;
-compose it with an input library (see the note on `kitty-keyboard` below)
-or plain `read()` calls.
+compose it with [`kitty-input`](https://github.com/itsmygithubacct/kitty-input)
+or plain `read()` calls. See the composition note below.
 
 
 ## Damage presents
@@ -296,12 +296,14 @@ allocation, or the terminal write fails, the failure latches:
 so the application can exit its render loop instead of animating into a void.
 The latch clears on the next start.
 
-## Composing with kitty-keyboard
+## Composing with kitty-input
 
 This library pairs with
-[`kitty-keyboard`](https://github.com/itsmygithubacct) for input; the two
-share no state. Start `kitty-framebuffer` first: its probe reads the
-graphics/DA1 responses from the input descriptor, and a keyboard decoder
+[`kitty-input`](https://github.com/itsmygithubacct/kitty-input) for input; its
+low-level decoder lives in
+[`third_party/kitty_keyboard`](https://github.com/itsmygithubacct/kitty-input/tree/main/third_party/kitty_keyboard).
+The libraries share no state. Start `kitty-framebuffer` first: its probe reads
+the graphics/DA1 responses from the input descriptor, and a keyboard decoder
 reading concurrently would swallow them. (Alternatively set
 `probe_graphics = false`.) Then start the keyboard layer with its
 `make_raw` disabled, since this library already owns raw mode - and stop
