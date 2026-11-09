@@ -9,7 +9,9 @@ crash-safe terminal restore.
 It is not installed on its own. It reaches programs through
 [kitty-terminal-session](https://github.com/itsmygithubacct/kitty-terminal-session#readme),
 which pins it as a submodule; Kilix games and apps compile it into their
-binaries, and those install on demand from the Kilix content catalog.
+binaries. Most of those install on demand, from the Kilix content catalog or the
+first time a Kilix command needs them; the PDF Viewer (kilix-pdf) is installed
+at first boot.
 
 ## What it does
 
@@ -17,8 +19,10 @@ binaries, and those install on demand from the Kilix content catalog.
   graphics support, and sizes a framebuffer to whole cells.
 - Encodes and writes frames on a presenter thread with a newest-frame-wins slot,
   so a slow terminal drops frames instead of stalling the render loop.
-- Sends pixels over POSIX shared memory when the terminal shares `/dev/shm`, or
-  inline as zlib and base64 escapes over ssh or tmux, choosing automatically.
+- Sends pixels over POSIX shared memory to a terminal that shares `/dev/shm`,
+  or inline as zlib and base64 escapes, which also work over ssh and through
+  tmux. `KITTYFB_TRANSPORT_AUTO` picks shared memory unless `shm_open()` fails
+  or the session runs under tmux; over ssh, request inline.
 - Patches only changed rectangles (`a=f` frame edits) and, on the Kilix kitty
   fork, composes scrolled viewports in place, falling back to a full present
   whenever that is cheaper or required.
@@ -149,9 +153,9 @@ kitty-framebuffer is one of the repositories behind
 install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
 running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
 desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
-It reaches a user compiled, through kitty-terminal-session, into the Kilix games
-and apps that install on demand from the Kilix content catalog. The map of every
-repository and how it ships is on the
+It reaches a user compiled, through kitty-terminal-session, into Kilix games
+and apps: most install on demand, and the PDF Viewer is installed at first boot.
+The map of every repository and how it ships is on the
 [components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## License
